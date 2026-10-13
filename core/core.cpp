@@ -159,6 +159,20 @@ void finished() {  // g_mutex held
     g_published.notify_all();
 }
 
+std::string base64(const std::string& in) {
+    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    o.reserve((in.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        uint32_t v = (uint8_t)in[i] << 16 | (i + 1 < in.size() ? (uint8_t)in[i + 1] << 8 : 0) |
+                     (i + 2 < in.size() ? (uint8_t)in[i + 2] : 0);
+        o += t[v >> 18], o += t[(v >> 12) & 63];
+        o += i + 1 < in.size() ? t[(v >> 6) & 63] : '=';
+        o += i + 2 < in.size() ? t[v & 63] : '=';
+    }
+    return o;
+}
+
 std::shared_ptr<const Capture> find_locked(int capture_id) {
     for (auto& c : g_captures)
         if ((int)c->id == capture_id) return c;
@@ -261,6 +275,24 @@ void serve() {
         auto c = find(std::stoi(req.matches[1]));
         if (!c) { res.status = 404; return; }
         res.set_content(capture_json(*c), "application/json");
+    });
+    // A capture as a file (.ffcap): everything the UI shows, opened later with no game running (cli/fixframe).
+    server.Get(R"(/api/captures/(\d+)/file)", [](const httplib::Request& req, httplib::Response& res) {
+        auto c = find(std::stoi(req.matches[1]));
+        if (!c) { res.status = 404; return; }
+        std::string o = "{\"fixframe\":1,\"app\":";
+        {
+            std::lock_guard lock(g_mutex);
+            str(o, g_app);
+            o += ",\"device\":";
+            str(o, g_device);
+            o += ",\"backend\":";
+            str(o, g_backend);
+        }
+        o += ",\"capture\":" + capture_json(*c) + ",\"image\":\"" + base64(c->png) + "\"}";
+        std::string name = "fixframe-frame" + std::to_string(c->frame) + ".ffcap";
+        res.set_header("Content-Disposition", "attachment; filename=\"" + name + "\"");
+        res.set_content(o, "application/octet-stream");
     });
     server.Get(R"(/api/captures/(\d+)/image.png)", [](const httplib::Request& req, httplib::Response& res) {
         auto c = find(std::stoi(req.matches[1]));

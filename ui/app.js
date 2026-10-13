@@ -10,6 +10,8 @@ let capture = null;   // the capture shown
 let selected = -1;    // draw index
 let frameSrc = '';    // the frame image shown (a pick capture keeps the image that was clicked)
 let frameInfo = '';
+let offline = false;  // opened from a saved capture (fixframe open): nothing that needs the game
+let pinned = null;    // the draw others are compared with: {capture, index}
 
 // The view lives in the query string (never a #fragment): ?capture=3&draw=120
 function remember() {
@@ -28,7 +30,10 @@ async function api(path, options) {
 async function poll() {
   try {
     const s = await api('status');
-    $('status').textContent = `${s.app} · ${s.device} · ${s.backend} · frame ${s.frame} · ${s.fps} fps · ${s.draws} draws`;
+    offline = !!s.offline;
+    $('capture').hidden = offline;
+    $('status').textContent = offline ? `Opened from ${s.offline} · ${s.app} · ${s.device} · ${s.backend}`
+      : `${s.app} · ${s.device} · ${s.backend} · frame ${s.frame} · ${s.fps} fps · ${s.draws} draws`;
     const sel = $('captures');
     const ids = s.captures.map((c) => String(c.id));
     if ([...sel.options].map((o) => o.value).join() !== ids.slice().reverse().join()) {
@@ -44,6 +49,8 @@ async function poll() {
 async function load(id, draw = -1) {
   capture = await api('captures/' + id);
   $('captures').value = id;
+  $('save').hidden = offline;
+  $('save').href = `/api/captures/${id}/file`;
   selected = -1;
   if (capture.image) frameSrc = `/api/captures/${id}/image.png`;
   frameInfo = `Frame ${capture.frame} · ${capture.draws.length} draws and dispatches · ${capture.passes.length} passes`;
@@ -99,6 +106,10 @@ function likelyDraw() {
 
 $('image').addEventListener('click', async (e) => {
   if (!capture || $('back').hidden === false) return;
+  if (offline) {
+    $('frameinfo').textContent = 'Picking a pixel needs the game running (this capture was opened from a file).';
+    return;
+  }
   const x = e.offsetX / e.target.clientWidth, y = e.offsetY / e.target.clientHeight;
   $('frameinfo').textContent = 'Finding the draws that wrote this pixel… (the game shows one odd frame)';
   try {
@@ -160,6 +171,7 @@ function renderList() {
       el('span', { className: 'n', textContent: i }),
       el('span', { className: 'what', textContent: d.label ? `${what} · ${d.label}` : what }));
     if (touched(d)) row.append(el('span', { className: 'hit', textContent: `● ${d.samples}`, title: 'Samples it wrote at the picked pixel' }));
+    if (pinned && pinned.capture.id === capture.id && pinned.index === i) row.append(el('span', { className: 'a', textContent: 'A', title: 'Compared with' }));
     row.dataset.index = i;
     row.setAttribute('aria-selected', i === selected);
     rows.push(row);
@@ -169,6 +181,56 @@ function renderList() {
 }
 
 // --- the inspector
+
+// Effective state: the program's own, with what the draw set dynamically in its place; the rest set per draw.
+function effective(c, d) {
+  const p = c.programs[d.program];
+  const dyn = new Map(d.dynamic);
+  const state = (p ? p.state : []).map(([k, v]) => dyn.has(k) ? [k, `${dyn.get(k)} (set per draw)`] : [k, v]);
+  const keys = new Set(state.map(([k]) => k));
+  return { state, perDraw: d.dynamic.filter(([k]) => !keys.has(k)) };
+}
+
+// Everything recorded about a draw, as label -> text, for comparing two draws (of any captures).
+function facts(c, i) {
+  const d = c.draws[i], p = c.programs[d.program], f = new Map();
+  const tex = (id) => {
+    const t = c.textures[id];
+    return t ? `${t.format} ${t.width}×${t.height}${t.name ? ' · ' + t.name : ''}` : '?';
+  };
+  f.set('Kind', d.kind).set('Count', String(d.count)).set('Instances', String(d.instances)).set('Label', d.label || '—');
+  if (d.pass >= 0) {
+    const ps = c.passes[d.pass];
+    f.set('Target size', `${ps.width}×${ps.height}`);
+    ps.colors.forEach((t, k) => f.set(`Colour target ${k}`, tex(t)));
+    if (ps.depth !== '0') f.set('Depth target', tex(ps.depth));
+  }
+  if (p) {
+    f.set('Pipeline', p.name || '(unnamed)');
+    p.shaders.forEach((s) => f.set(`Shader, ${s.stage}`, `${s.name || '(unnamed)'} ${s.hash}`));
+  }
+  const { state, perDraw } = effective(c, d);
+  for (const [k, v] of state.concat(perDraw)) f.set(k, v);
+  for (const [slot, t] of d.textures) f.set(`Texture, ${slot}`, tex(t));
+  return f;
+}
+
+function comparison(i) {
+  const a = facts(pinned.capture, pinned.index), b = facts(capture, i);
+  const rows = [...new Set([...a.keys(), ...b.keys()])].filter((k) => a.get(k) !== b.get(k));
+  const where = pinned.capture.id === capture.id ? `draw ${pinned.index}` : `draw ${pinned.index} of capture ${pinned.capture.id}`;
+  const parts = [el('h2', { textContent: `Different from A (${where})` })];
+  if (!rows.length) {
+    parts.push(el('p', { className: 'hint', textContent: `Nothing: the ${a.size} things Fixframe records are the same.` }));
+  } else {
+    parts.push(el('table', { className: 'diff' },
+      el('tr', {}, el('th', { textContent: '' }), el('th', { textContent: 'A' }), el('th', { textContent: 'This draw' })),
+      ...rows.map((k) => el('tr', {}, el('td', { textContent: k }),
+        el('td', { className: 'mono', textContent: a.get(k) ?? '—' }), el('td', { className: 'mono', textContent: b.get(k) ?? '—' })))),
+      el('p', { className: 'hint', textContent: `${rows.length} different, ${new Set([...a.keys(), ...b.keys()]).size - rows.length} the same.` }));
+  }
+  return parts;
+}
 
 function table(pairs, mono = false) {
   return el('table', {}, ...pairs.map(([k, v]) =>
@@ -190,21 +252,32 @@ function select(i, scroll = false) {
   }
   const d = capture.draws[i];
   const p = capture.programs[d.program];
-  const parts = [
+  const isA = pinned && pinned.capture.id === capture.id && pinned.index === i;
+  const parts = [];
+  if (pinned) {
+    const clear = el('button', { type: 'button', className: 'quiet', textContent: 'Stop comparing' });
+    clear.addEventListener('click', () => { pinned = null; renderList(); select(selected); });
+    parts.push(el('div', { className: 'compare' },
+      el('span', { textContent: isA ? 'This is A: select another draw (any capture) to compare.' : 'Comparing with A' }), clear));
+    if (!isA) parts.push(...comparison(i));
+  }
+  parts.push(
     el('h2', { textContent: `Draw ${i}` }),
     table([['Kind', d.kind], ['Count', d.count], ['Instances', d.instances], ['Label', d.label || '—'],
-           ['Pass', describePass(d.pass)]].concat(d.samples >= 0 ? [['At the picked pixel', `${d.samples} samples`]] : [])),
-  ];
-  if (d.pass >= 0) {
+           ['Pass', describePass(d.pass)]].concat(d.samples >= 0 ? [['At the picked pixel', `${d.samples} samples`]] : [])));
+  const actions = el('div', { className: 'actions' });
+  if (d.pass >= 0 && !offline) {
     const b = el('button', { type: 'button', className: 'quiet', textContent: 'Show its target right after this draw' });
     b.addEventListener('click', () => scrub(i, b));
-    parts.push(el('p', {}, b));
+    actions.append(b);
   }
-  // Effective state: the program's own, with what this draw set dynamically in its place.
-  const dyn = new Map(d.dynamic);
-  const state = (p ? p.state : []).map(([k, v]) => dyn.has(k) ? [k, `${dyn.get(k)} (set per draw)`] : [k, v]);
-  const keys = new Set(state.map(([k]) => k));
-  const perDraw = d.dynamic.filter(([k]) => !keys.has(k));
+  if (!isA) {
+    const b = el('button', { type: 'button', className: 'quiet', textContent: 'Compare other draws with this one' });
+    b.addEventListener('click', () => { pinned = { capture, index: i }; renderList(); select(i); });
+    actions.append(b);
+  }
+  parts.push(actions);
+  const { state, perDraw } = effective(capture, d);
   if (p) {
     if (p.name) parts.push(el('p', { className: 'mono', textContent: p.name }));
     parts.push(el('h2', { textContent: 'Shaders' }), el('table', {}, ...p.shaders.map((s) =>

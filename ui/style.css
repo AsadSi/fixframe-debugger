@@ -47,7 +47,15 @@ section:last-child { border-right: 0; }
 .view img { max-width: 100%; border: 1px solid var(--line); border-radius: 4px; cursor: crosshair; }
 .cross { position: absolute; width: 17px; height: 17px; margin: -8px 0 0 -8px; border: 2px solid var(--accent);
          border-radius: 50%; box-shadow: 0 0 0 1px #000; pointer-events: none; }
-button.quiet { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button.quiet, a.button { background: transparent; color: var(--accent); border: 1px solid var(--line); border-radius: 6px;
+                         padding: 6px 11px; font-weight: 600; text-decoration: none; white-space: nowrap; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.compare { background: var(--select); border-radius: 6px; padding: 8px 10px; margin: 10px 0; display: flex;
+           justify-content: space-between; align-items: center; gap: 8px; }
+.compare button { padding: 3px 8px; }
+.diff td { padding-right: 8px; }
+.diff th { text-align: left; color: var(--muted); font-weight: 600; padding: 3px 8px 3px 0; }
+.draw .a { color: var(--accent); font-weight: 700; flex: none; }
 .toggle { display: flex; gap: 6px; align-items: center; margin: 0 8px 8px; color: var(--muted); }
 .draw .hit { color: var(--accent); flex: none; }
 .empty { color: var(--muted); margin-top: 30vh; text-align: center; }
