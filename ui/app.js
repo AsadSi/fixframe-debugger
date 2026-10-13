@@ -54,6 +54,8 @@ async function load(id, draw = -1) {
   selected = -1;
   if (capture.image) frameSrc = `/api/captures/${id}/image.png`;
   frameInfo = `Frame ${capture.frame} · ${capture.draws.length} draws and dispatches · ${capture.passes.length} passes`;
+  const skipped = capture.draws.filter((d) => d.skipped).length;
+  if (skipped) frameInfo += ` · ${skipped} skipped by the renderer`;
   if (capture.pick) {
     const n = capture.draws.filter(touched).length;
     frameInfo += ` · ${n} draw${n === 1 ? '' : 's'} wrote the picked pixel`;
@@ -160,16 +162,16 @@ function renderList() {
   capture.draws.forEach((d, i) => {
     if (onlyPicked && !touched(d)) return;
     const what = `${d.kind} ${d.count}${d.instances > 1 ? ' ×' + d.instances : ''}`;
-    const hay = `${d.label} ${shaderNames(d)} ${textureNames(d)} ${what}`.toLowerCase();
+    const hay = `${d.label} ${shaderNames(d)} ${textureNames(d)} ${what} ${d.skipped ? 'skipped ' + d.skipped : ''}`.toLowerCase();
     if (words.some((w) => !hay.includes(w))) return;
     const key = targets(d.pass);
     if (key !== group) {
       group = key;
       rows.push(el('div', { className: 'pass', textContent: key, title: targets(d.pass, true) }));
     }
-    const row = el('div', { className: 'draw', role: 'option' },
-      el('span', { className: 'n', textContent: i }),
-      el('span', { className: 'what', textContent: d.label ? `${what} · ${d.label}` : what }));
+    const text = d.skipped ? `${what} · skipped: ${d.skipped}` : d.label ? `${what} · ${d.label}` : what;
+    const row = el('div', { className: d.skipped ? 'draw skipped' : 'draw', role: 'option' },
+      el('span', { className: 'n', textContent: i }), el('span', { className: 'what', textContent: text }));
     if (touched(d)) row.append(el('span', { className: 'hit', textContent: `● ${d.samples}`, title: 'Samples it wrote at the picked pixel' }));
     if (pinned && pinned.capture.id === capture.id && pinned.index === i) row.append(el('span', { className: 'a', textContent: 'A', title: 'Compared with' }));
     row.dataset.index = i;
@@ -199,6 +201,7 @@ function facts(c, i) {
     return t ? `${t.format} ${t.width}×${t.height}${t.name ? ' · ' + t.name : ''}` : '?';
   };
   f.set('Kind', d.kind).set('Count', String(d.count)).set('Instances', String(d.instances)).set('Label', d.label || '—');
+  f.set('Drawn', d.skipped ? `no: ${d.skipped}` : 'yes');
   if (d.pass >= 0) {
     const ps = c.passes[d.pass];
     f.set('Target size', `${ps.width}×${ps.height}`);
@@ -263,8 +266,9 @@ function select(i, scroll = false) {
   }
   parts.push(
     el('h2', { textContent: `Draw ${i}` }),
-    table([['Kind', d.kind], ['Count', d.count], ['Instances', d.instances], ['Label', d.label || '—'],
-           ['Pass', describePass(d.pass)]].concat(d.samples >= 0 ? [['At the picked pixel', `${d.samples} samples`]] : [])));
+    table([['Kind', d.kind]].concat(d.skipped ? [['Skipped by the renderer', d.skipped]] : [],
+          [['Count', d.count], ['Instances', d.instances], ['Label', d.label || '—'],
+           ['Pass', describePass(d.pass)]], d.samples >= 0 ? [['At the picked pixel', `${d.samples} samples`]] : [])));
   const actions = el('div', { className: 'actions' });
   if (d.pass >= 0 && !offline) {
     const b = el('button', { type: 'button', className: 'quiet', textContent: 'Show its target right after this draw' });

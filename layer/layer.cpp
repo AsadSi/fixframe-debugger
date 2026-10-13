@@ -21,10 +21,6 @@
 
 #include "../core/core.h"
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_STATIC
-#define STBI_WRITE_NO_STDIO
-#include "stb_image_write.h"
 
 namespace fixframe {
 namespace {
@@ -543,8 +539,6 @@ uint32_t texel_size(VkFormat f) {
     }
 }
 
-void write_png(void* ctx, void* data, int size) { static_cast<std::string*>(ctx)->append((const char*)data, size); }
-
 // A PNG of an image's texels. Float colour (scene buffers, linear) is clamped to 0..1 and gamma-encoded; depth is
 // stretched over its own range so it can be seen. Empty for formats texel_size() does not know.
 std::string picture(VkFormat f, const uint8_t* src, uint32_t w, uint32_t h) {
@@ -607,9 +601,7 @@ std::string picture(VkFormat f, const uint8_t* src, uint32_t w, uint32_t h) {
             if (linear) x = std::pow(x, 1 / 2.2f);
             rgba[i * 4 + c] = uint8_t(x * 255 + 0.5f);
         }
-    std::string png;
-    stbi_write_png_to_func(write_png, &png, (int)w, (int)h, 4, rgba.data(), (int)w * 4);
-    return png;
+    return core::png(rgba.data(), w, h);
 }
 
 // --- recording, resolving

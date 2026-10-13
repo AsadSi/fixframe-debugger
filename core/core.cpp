@@ -12,6 +12,11 @@
 #include "httplib.h"
 #include "ui_assets.h"  // generated from ui/ (cmake/embed.cmake)
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#define STBI_WRITE_NO_STDIO
+#include "stb_image_write.h"
+
 namespace fixframe::core {
 namespace {
 
@@ -125,6 +130,10 @@ std::string capture_json(const Capture& c) {
         o += ",\"key\":" + id(d.key) + ",\"samples\":" + std::to_string(d.samples) + ",\"count\":" + std::to_string(d.count) + ",\"instances\":" + std::to_string(d.instances) +
              ",\"pass\":" + std::to_string(d.pass) + ",\"label\":";
         str(o, d.label);
+        if (!d.skipped.empty()) {
+            o += ",\"skipped\":";
+            str(o, d.skipped);
+        }
         o += ",\"program\":" + (d.program ? id(d.program->id) : std::string("null")) + ",\"dynamic\":";
         kvs(o, d.dynamic);
         o += ",\"textures\":";
@@ -148,6 +157,13 @@ bool run(const Request& r, httplib::Response& res, std::unique_lock<std::mutex>&
         g_pending = false;
         res.status = 504;
         res.set_content("{\"error\":\"the game presented no frames for 15 s\"}", "application/json");
+        return false;
+    }
+    if (g_result_png.empty() && !g_result_error.empty()) {
+        res.status = 422;
+        std::string o = "{\"error\":";
+        str(o, g_result_error);
+        res.set_content(o + '}', "application/json");
         return false;
     }
     return true;
@@ -261,15 +277,7 @@ void serve() {
         Request r{Request::kScrub};
         r.anchor = c->draws[anchor].key, r.target = c->draws[i].key;
         for (size_t j = anchor + 1; j < i; j++) r.nth += c->draws[j].key == r.target;
-        if (!run(r, res, lock)) return;
-        if (g_result_png.empty()) {
-            res.status = 422;
-            std::string o = "{\"error\":";
-            str(o, g_result_error);
-            res.set_content(o + '}', "application/json");
-            return;
-        }
-        res.set_content(g_result_png, "image/png");
+        if (run(r, res, lock)) res.set_content(g_result_png, "image/png");
     });
     server.Get(R"(/api/captures/(\d+))", [](const httplib::Request& req, httplib::Response& res) {
         auto c = find(std::stoi(req.matches[1]));
@@ -337,6 +345,7 @@ void publish(std::unique_ptr<Capture> capture) {
     std::lock_guard lock(g_mutex);
     capture->id = g_next_id++;
     g_result_capture = capture->id;
+    g_result_png.clear(), g_result_error.clear();
     g_captures.push_back(std::move(capture));
     if (g_captures.size() > kKeep) g_captures.pop_front();
     g_taken = false;
@@ -348,6 +357,15 @@ void scrubbed(std::string png, std::string error) {
     g_result_png = std::move(png), g_result_error = std::move(error);
     g_taken = false;
     finished();
+}
+
+void failed(std::string error) { scrubbed({}, std::move(error)); }
+
+std::string png(const uint8_t* rgba, uint32_t width, uint32_t height) {
+    std::string out;
+    stbi_write_png_to_func([](void* ctx, void* data, int size) { static_cast<std::string*>(ctx)->append((const char*)data, size); },
+                           &out, (int)width, (int)height, 4, rgba, (int)width * 4);
+    return out;
 }
 
 }  // namespace fixframe::core

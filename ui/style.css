@@ -41,6 +41,7 @@ section:last-child { border-right: 0; }
 .draw .what { overflow: hidden; text-overflow: ellipsis; }
 .draw:hover { background: var(--bg); }
 .draw[aria-selected="true"] { background: var(--select); }
+.draw.skipped .what { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--line); }
 
 .frame { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 14px; }
 .view { position: relative; max-width: 100%; line-height: 0; }

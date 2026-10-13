@@ -51,6 +51,7 @@ struct Draw {
     uint32_t count = 0, instances = 0;
     int pass = -1;  // index in Capture::passes, -1 outside a pass (dispatches)
     std::string label;
+    std::string skipped;  // the renderer drew nothing for it, and why (SDK backends: "shader-failed", ...)
     std::shared_ptr<const Program> program;
     std::vector<KV> dynamic;   // viewport, scissor, push constants: state set per draw
     std::vector<KV> textures;  // slot ("set 0 binding 3") -> Texture id (decimal)
@@ -90,6 +91,10 @@ bool take_request(Request& out);
 void publish(std::unique_ptr<Capture> capture);
 // Backends: a finished scrub: the target after the draw as a PNG, or why there is none.
 void scrubbed(std::string png, std::string error);
+// Backends: the request taken can't be carried out (shown to the user as is).
+void failed(std::string error);
+// A PNG of RGBA8 pixels (rows of width * 4 bytes).
+std::string png(const uint8_t* rgba, uint32_t width, uint32_t height);
 
 }  // namespace core
 }  // namespace fixframe
