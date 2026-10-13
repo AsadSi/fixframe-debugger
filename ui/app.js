@@ -8,6 +8,8 @@ const el = (tag, props = {}, ...kids) => {
 
 let capture = null;   // the capture shown
 let selected = -1;    // draw index
+let frameSrc = '';    // the frame image shown (a pick capture keeps the image that was clicked)
+let frameInfo = '';
 
 // The view lives in the query string (never a #fragment): ?capture=3&draw=120
 function remember() {
@@ -20,7 +22,7 @@ function remember() {
 async function api(path, options) {
   const r = await fetch('/api/' + path, options);
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
-  return r.json();
+  return r.headers.get('content-type')?.startsWith('image/') ? r.blob() : r.json();
 }
 
 async function poll() {
@@ -29,7 +31,7 @@ async function poll() {
     $('status').textContent = `${s.app} · ${s.device} · ${s.backend} · frame ${s.frame} · ${s.fps} fps · ${s.draws} draws`;
     const sel = $('captures');
     const ids = s.captures.map((c) => String(c.id));
-    if ([...sel.options].map((o) => o.value).join() !== ids.join()) {
+    if ([...sel.options].map((o) => o.value).join() !== ids.slice().reverse().join()) {
       sel.replaceChildren(...s.captures.slice().reverse().map((c) =>
         el('option', { value: c.id, textContent: `Capture ${c.id} · frame ${c.frame} · ${c.draws} draws` })));
       if (capture) sel.value = capture.id;
@@ -43,16 +45,72 @@ async function load(id, draw = -1) {
   capture = await api('captures/' + id);
   $('captures').value = id;
   selected = -1;
-  const img = $('image');
-  img.hidden = !capture.image;
-  if (capture.image) img.src = `/api/captures/${id}/image.png`;
+  if (capture.image) frameSrc = `/api/captures/${id}/image.png`;
+  frameInfo = `Frame ${capture.frame} · ${capture.draws.length} draws and dispatches · ${capture.passes.length} passes`;
+  if (capture.pick) {
+    const n = capture.draws.filter(touched).length;
+    frameInfo += ` · ${n} draw${n === 1 ? '' : 's'} wrote the picked pixel`;
+  } else if (!capture.image) {
+    frameInfo += ' · the presented image could not be read back';
+  }
   $('empty').hidden = true;
-  $('frameinfo').textContent =
-    `Frame ${capture.frame} · ${capture.draws.length} draws and dispatches · ${capture.passes.length} passes` +
-    (capture.image ? '' : ' · the presented image could not be read back');
+  showFrame();
+  $('pickonly').hidden = !capture.pick;
   renderList();
-  select(draw < capture.draws.length ? draw : -1);
+  if (draw < 0 && capture.pick) draw = likelyDraw();
+  select(draw < capture.draws.length ? draw : -1, true);
 }
+
+function showFrame() {
+  $('view').hidden = !frameSrc;
+  $('image').src = frameSrc;
+  $('frameinfo').textContent = frameInfo;
+  $('back').hidden = true;
+  const cross = $('cross');
+  cross.hidden = !capture?.pick;
+  if (capture?.pick) {
+    cross.style.left = capture.pick[0] * 100 + '%';
+    cross.style.top = capture.pick[1] * 100 + '%';
+  }
+}
+
+// --- picks
+
+// A target whose shape differs from the screen's (a shadow map, an atlas) maps the picked pixel nowhere useful.
+function onScreen(d) {
+  if (d.pass < 0) return false;
+  const p = capture.passes[d.pass], img = $('image');
+  if (!img.naturalWidth || !p.height) return true;
+  return Math.abs(p.width / p.height - img.naturalWidth / img.naturalHeight) < 0.1;
+}
+const touched = (d) => d.samples > 0 && onScreen(d);
+const fullscreen = (d) => d.count <= 6 && d.instances <= 1;  // a quad or a big triangle: a full-screen pass
+
+// The draw most likely meant: the last geometry draw that wrote the pixel (full-screen passes come after).
+function likelyDraw() {
+  let last = -1, lastAny = -1;
+  capture.draws.forEach((d, i) => {
+    if (!touched(d)) return;
+    lastAny = i;
+    if (!fullscreen(d)) last = i;
+  });
+  return last >= 0 ? last : lastAny;
+}
+
+$('image').addEventListener('click', async (e) => {
+  if (!capture || $('back').hidden === false) return;
+  const x = e.offsetX / e.target.clientWidth, y = e.offsetY / e.target.clientHeight;
+  $('frameinfo').textContent = 'Finding the draws that wrote this pixel… (the game shows one odd frame)';
+  try {
+    const { id } = await api(`pick?x=${x.toFixed(5)}&y=${y.toFixed(5)}`, { method: 'POST' });
+    await poll();
+    await load(id);
+  } catch (err) {
+    $('frameinfo').textContent = 'Pick failed: ' + err.message;
+  }
+});
+
+// --- the list
 
 function shaderNames(d) {
   const p = capture.programs[d.program];
@@ -66,58 +124,68 @@ function textureNames(d) {
   }).join(' ');
 }
 
-// What a pass renders into: "1920×1080 · R8G8B8A8_UNORM + D32_SFLOAT". Emulators often begin a pass per draw,
-// so the list groups consecutive passes with the same targets under one header.
-function targets(i) {
+// What a pass renders into: "1920×1080 · R8G8B8A8_UNORM + D32_SFLOAT" (names: true adds the textures' names).
+// Emulators often begin a pass per draw, so the list groups consecutive passes with the same targets.
+function targets(i, names = false) {
   if (i < 0) return 'Outside render passes';
   const p = capture.passes[i];
   const name = (id) => {
     const t = capture.textures[id];
-    return t ? (t.name ? `${t.name} (${t.format})` : t.format) : '?';
+    return !t ? '?' : names && t.name ? `${t.name} (${t.format})` : t.format;
   };
-  const list = p.colors.map(name).concat(p.depth !== '0' ? [name(p.depth)] : []).join(' + ');
-  return `${p.width}×${p.height}${list ? ' · ' + list : ''}`;
+  const ids = p.colors.concat(p.depth !== '0' ? [p.depth] : []);
+  return `${p.width}×${p.height}${ids.length ? ' · ' + ids.map(name).join(' + ') : ''}`;
 }
 
 function describePass(i) {
-  return i < 0 ? targets(i) : `Pass ${i} · ${targets(i)}`;
+  return i < 0 ? targets(i) : `Pass ${i} · ${targets(i, true)}`;
 }
 
 function renderList() {
   const words = $('filter').value.toLowerCase().split(/\s+/).filter(Boolean);
+  const onlyPicked = capture.pick && $('pickonly').firstElementChild.checked;
   const rows = [];
   let group = null;
   capture.draws.forEach((d, i) => {
+    if (onlyPicked && !touched(d)) return;
     const what = `${d.kind} ${d.count}${d.instances > 1 ? ' ×' + d.instances : ''}`;
     const hay = `${d.label} ${shaderNames(d)} ${textureNames(d)} ${what}`.toLowerCase();
     if (words.some((w) => !hay.includes(w))) return;
     const key = targets(d.pass);
     if (key !== group) {
       group = key;
-      rows.push(el('div', { className: 'pass', textContent: key }));
+      rows.push(el('div', { className: 'pass', textContent: key, title: targets(d.pass, true) }));
     }
     const row = el('div', { className: 'draw', role: 'option' },
       el('span', { className: 'n', textContent: i }),
       el('span', { className: 'what', textContent: d.label ? `${what} · ${d.label}` : what }));
+    if (touched(d)) row.append(el('span', { className: 'hit', textContent: `● ${d.samples}`, title: 'Samples it wrote at the picked pixel' }));
     row.dataset.index = i;
     row.setAttribute('aria-selected', i === selected);
     rows.push(row);
   });
+  if (!rows.length) rows.push(el('p', { className: 'hint', textContent: 'No draws match.', style: 'padding: 0 10px' }));
   $('draws').replaceChildren(...rows);
 }
+
+// --- the inspector
 
 function table(pairs, mono = false) {
   return el('table', {}, ...pairs.map(([k, v]) =>
     el('tr', {}, el('td', { textContent: k }), el('td', { className: mono ? 'mono' : '', textContent: v }))));
 }
 
-function select(i) {
+function select(i, scroll = false) {
   selected = i;
-  for (const r of $('draws').querySelectorAll('.draw')) r.setAttribute('aria-selected', +r.dataset.index === i);
+  for (const r of $('draws').querySelectorAll('.draw')) {
+    r.setAttribute('aria-selected', +r.dataset.index === i);
+    if (scroll && +r.dataset.index === i) r.scrollIntoView({ block: 'center' });
+  }
   remember();
   const box = $('inspector');
   if (i < 0) {
-    box.replaceChildren(el('p', { className: 'hint', textContent: 'Select a draw to see what it draws with.' }));
+    box.replaceChildren(el('p', { className: 'hint', textContent:
+      capture ? 'Select a draw, or click the frame to find the draws that wrote a pixel.' : 'Select a draw to see what it draws with.' }));
     return;
   }
   const d = capture.draws[i];
@@ -125,8 +193,13 @@ function select(i) {
   const parts = [
     el('h2', { textContent: `Draw ${i}` }),
     table([['Kind', d.kind], ['Count', d.count], ['Instances', d.instances], ['Label', d.label || '—'],
-           ['Pass', describePass(d.pass)]]),
+           ['Pass', describePass(d.pass)]].concat(d.samples >= 0 ? [['At the picked pixel', `${d.samples} samples`]] : [])),
   ];
+  if (d.pass >= 0) {
+    const b = el('button', { type: 'button', className: 'quiet', textContent: 'Show its target right after this draw' });
+    b.addEventListener('click', () => scrub(i, b));
+    parts.push(el('p', {}, b));
+  }
   // Effective state: the program's own, with what this draw set dynamically in its place.
   const dyn = new Map(d.dynamic);
   const state = (p ? p.state : []).map(([k, v]) => dyn.has(k) ? [k, `${dyn.get(k)} (set per draw)`] : [k, v]);
@@ -151,6 +224,26 @@ function select(i) {
   box.replaceChildren(...parts);
 }
 
+// The draw's target as it is right after the draw, from a fresh frame of the game.
+async function scrub(i, button) {
+  button.disabled = true;
+  button.textContent = 'Reading its target…';
+  try {
+    const blob = await api(`captures/${capture.id}/draws/${i}/target`, { method: 'POST' });
+    $('image').src = URL.createObjectURL(blob);
+    $('view').hidden = false;
+    $('cross').hidden = true;
+    $('frameinfo').textContent = `${describePass(capture.draws[i].pass)}, right after draw ${i} (from a new frame)`;
+    $('back').hidden = false;
+  } catch (err) {
+    $('frameinfo').textContent = `Draw ${i}: ${err.message}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Show its target right after this draw';
+  }
+}
+
+$('back').addEventListener('click', showFrame);
 $('draws').addEventListener('click', (e) => {
   const row = e.target.closest('.draw');
   if (row) select(+row.dataset.index);
@@ -165,6 +258,7 @@ $('draws').addEventListener('keydown', (e) => {
 });
 $('draws').tabIndex = 0;
 $('filter').addEventListener('input', () => capture && renderList());
+$('pickonly').addEventListener('change', () => capture && renderList());
 $('captures').addEventListener('change', (e) => load(e.target.value));
 $('capture').addEventListener('click', async () => {
   const b = $('capture');

@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 #include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
@@ -71,6 +73,7 @@ struct ImageInfo {
     VkFormat format;
     VkExtent3D extent;
     uint32_t mips, layers;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 struct SwapchainInfo {
     VkFormat format;
@@ -82,7 +85,7 @@ struct SwapchainInfo {
 // Dynamic state the layer follows, as bits; a pipeline's mask says which of them it takes from the command
 // buffer instead of its own create info. The keys match pipeline_state()'s, so a draw's values replace them.
 enum DynBit : uint16_t { kCull = 1, kFront = 2, kTopology = 4, kDepthTest = 8, kDepthWrite = 16, kDepthCompare = 32,
-                         kDepthBias = 64, kStencil = 128 };
+                         kDepthBias = 64, kStencil = 128, kScissor = 256, kScissorCount = 512 };
 struct Dyn {
     VkCullModeFlags cull = 0;
     VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -164,6 +167,8 @@ uint16_t dynamic_mask(const VkPipelineDynamicStateCreateInfo* dy) {
         case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP: m |= kDepthCompare; break;
         case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: m |= kDepthBias; break;
         case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE: m |= kStencil; break;
+        case VK_DYNAMIC_STATE_SCISSOR: m |= kScissor; break;
+        case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT: m |= kScissorCount; break;
         default: break;
     }
     return m;
@@ -259,6 +264,11 @@ struct PassRec {
     std::vector<VkImageView> views;  // colours then depth (told apart by format at capture)
     VkExtent2D extent;
     uint32_t label;
+    // what a scrub copies when the pass ends: colour attachment 0, else depth (dynamic rendering only)
+    VkImage image = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageAspectFlags aspect = 0;
+    ImageInfo info{};
 };
 
 struct Rec {
@@ -271,6 +281,9 @@ struct Rec {
     VkRect2D scissor{};
     Dyn dyn;
     VkCommandBuffer secondary = VK_NULL_HANDLE;  // kExecute
+    uint64_t key = 0;                            // Draw::key
+    VkQueryPool pool = VK_NULL_HANDLE;           // pick frames: its occlusion query
+    uint32_t query = 0;
 };
 
 struct CbState {
@@ -289,7 +302,15 @@ struct CbState {
     std::vector<uint32_t> labels;
     VkViewport viewport{};
     VkRect2D scissor{};
+    bool scissor_ext = false;  // the app sets scissors through the EXT entry point
     Dyn dyn;
+    // a job's frame (see Job)
+    const void* job = nullptr;   // the pick job its query pool belongs to
+    VkQueryPool pool = VK_NULL_HANDLE;
+    uint32_t queries = 0;
+    bool in_query = false;
+    int clipped = 0;             // the draw's scissor was set to the picked pixel: 1 SetScissor, 2 WithCount
+    int scrub_pass = -1;         // the pass of the scrubbed draw: its later draws are skipped
 
     void reset() { *this = CbState(); }
 };
@@ -317,8 +338,7 @@ std::string label_text(uint32_t id) {
     return g_labels[id];
 }
 
-void record(const vkroots::VkCommandBufferDispatch& d, Kind kind, uint32_t a, uint32_t b) {
-    CbState& s = state(d);
+Rec& record(CbState& s, Kind kind, uint32_t a, uint32_t b) {
     int bp = kind == kDispatch || kind == kDispatchIndirect ? 1 : 0;
     if (s.bound[bp] < 0) {
         s.bindings.push_back(s.cur[bp]);
@@ -330,8 +350,11 @@ void record(const vkroots::VkCommandBufferDispatch& d, Kind kind, uint32_t a, ui
     }
     Rec r{kind, a, b, s.pipeline[bp], bp ? -1 : s.pass, s.bound[bp], s.push, s.labels.empty() ? 0 : s.labels.back(),
           s.viewport, s.scissor, s.dyn};
+    uint64_t parts[] = {(uint64_t)r.pipeline, r.kind, r.a, r.b, r.label};
+    r.key = fnv(parts, sizeof parts);
     s.recs.push_back(r);
     s.draws++;
+    return s.recs.back();
 }
 
 void push_descriptors(const vkroots::VkCommandBufferDispatch& d, VkPipelineBindPoint bp, uint32_t set, uint32_t count,
@@ -364,6 +387,16 @@ void begin_rendering(const vkroots::VkCommandBufferDispatch& d, const VkRenderin
     else if (info->pStencilAttachment && info->pStencilAttachment->imageView)
         views.push_back(info->pStencilAttachment->imageView);
     begin_pass(d, std::move(views), info->renderArea.extent);
+    const VkRenderingAttachmentInfo* a = info->colorAttachmentCount && info->pColorAttachments[0].imageView
+                                             ? &info->pColorAttachments[0] : info->pDepthAttachment;
+    if (!a || !a->imageView) return;
+    PassRec& p = state(d).passes.back();
+    std::shared_lock lock(g_objects);
+    auto v = g_views.find(a->imageView);
+    auto i = v == g_views.end() ? g_images.end() : g_images.find(v->second);
+    if (i == g_images.end()) return;
+    p.image = i->first, p.layout = a->imageLayout, p.info = i->second;
+    p.aspect = a == info->pDepthAttachment ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
 void begin_render_pass(const vkroots::VkCommandBufferDispatch& d, const VkRenderPassBeginInfo* info) {
@@ -380,12 +413,206 @@ void begin_render_pass(const vkroots::VkCommandBufferDispatch& d, const VkRender
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Frames and captures
+// Frames, captures and one-frame jobs (pick, scrub)
+
+struct DeviceInfo {
+    VkPhysicalDevice gpu = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryProperties memory{};
+    std::unordered_map<VkQueue, uint32_t> queue_family;
+};
+DeviceInfo g_device;
 
 std::atomic<uint64_t> g_frame{0};
 std::atomic<uint32_t> g_frame_draws{0};
 std::mutex g_capture_mutex;              // the capture being built (submits can come from several threads)
 std::unique_ptr<Capture> g_building;     // non-null while the frame being captured is submitted
+std::vector<std::pair<VkQueryPool, uint32_t>> g_pick_slots;  // pick captures: each draw's query
+
+struct Readback;
+
+// A one-frame experiment the UI asked for. Games record a frame while the one before is still being presented, so a
+// job armed at a present stays on for two: the frame submitted between the second and third present was recorded
+// wholly inside it (that frame is the pick capture), and its results are read at the third. Its Vulkan objects
+// live a few frames longer (retired), in case a command buffer that used them is submitted again without being
+// recorded again.
+struct Job {
+    Request req;
+    std::mutex m;
+    std::vector<VkQueryPool> pools;  // kPick: one per primary command buffer
+    Readback* target = nullptr;  // kScrub
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{};
+    bool found = false, copied = false;
+    std::string error;
+    int presents = 0;  // seen since it was armed
+    bool counting = false;  // kScrub: the anchor was recorded; draws with the target's key since it
+    uint32_t counted = 0;
+    uint64_t retire_at = 0;
+};
+std::atomic<Job*> g_job{nullptr};   // the job of the frame being recorded
+std::unique_ptr<Job> g_running;     // its owner (present thread)
+std::vector<std::unique_ptr<Job>> g_retired;
+constexpr uint32_t kQueries = 4096;
+
+// A host-visible buffer an image is copied into.
+struct Readback {
+    const vkroots::VkDeviceDispatch* d = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+
+    bool create(const vkroots::VkDeviceDispatch& dd, VkDeviceSize size) {
+        d = &dd;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (d->CreateBuffer(d->Device, &bci, nullptr, &buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements req;
+        d->GetBufferMemoryRequirements(d->Device, buffer, &req);
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t i = 0; i < g_device.memory.memoryTypeCount; i++)
+            if ((req.memoryTypeBits & (1u << i)) && (g_device.memory.memoryTypes[i].propertyFlags & want) == want) {
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, i};
+                return d->AllocateMemory(d->Device, &mai, nullptr, &memory) == VK_SUCCESS &&
+                       d->BindBufferMemory(d->Device, buffer, memory, 0) == VK_SUCCESS;
+            }
+        return false;
+    }
+    const uint8_t* map() {
+        void* p = nullptr;
+        return d->MapMemory(d->Device, memory, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS ? (const uint8_t*)p : nullptr;
+    }
+    void destroy() {  // freeing mapped memory unmaps it
+        if (buffer) d->DestroyBuffer(d->Device, buffer, nullptr);
+        if (memory) d->FreeMemory(d->Device, memory, nullptr);
+        buffer = VK_NULL_HANDLE, memory = VK_NULL_HANDLE;
+    }
+};
+
+// Records a copy of mip 0, layer 0 of an image into a buffer; the image is in `layout` before and after.
+void record_copy(const vkroots::VkDeviceDispatch& d, VkCommandBuffer cb, VkImage image, VkImageAspectFlags aspect,
+                 VkImageLayout layout, VkExtent3D extent, VkBuffer buffer) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = layout;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {aspect, 0, 0, 1};
+    copy.imageExtent = {extent.width, extent.height, 1};
+    d.CmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    std::swap(b.oldLayout, b.newLayout);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+}
+
+// --- pictures of images
+
+float half(uint16_t h) {
+    int e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? 65504.f : std::ldexp((float)(m | 1024), e - 25);
+    return h & 0x8000 ? -v : v;
+}
+float small_float(uint32_t bits, int mantissa) {  // the unsigned 11- and 10-bit floats of B10G11R11
+    uint32_t e = bits >> mantissa, m = bits & ((1u << mantissa) - 1);
+    if (e == 0) return std::ldexp((float)m, -14 - mantissa);
+    if (e == 31) return 65504.f;
+    return std::ldexp((float)(m | (1u << mantissa)), (int)e - 15 - mantissa);
+}
+
+// Bytes per texel of the formats the layer can show (depth formats: their depth aspect); 0 for the others.
+uint32_t texel_size(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UNORM: return 1;
+        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_D16_UNORM: return 2;
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+            return 4;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+        case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+        default: return 0;
+    }
+}
+
+void write_png(void* ctx, void* data, int size) { static_cast<std::string*>(ctx)->append((const char*)data, size); }
+
+// A PNG of an image's texels. Float colour (scene buffers, linear) is clamped to 0..1 and gamma-encoded; depth is
+// stretched over its own range so it can be seen. Empty for formats texel_size() does not know.
+std::string picture(VkFormat f, const uint8_t* src, uint32_t w, uint32_t h) {
+    uint32_t ts = texel_size(f);
+    if (!ts) return {};
+    size_t n = size_t(w) * h;
+    std::vector<float> rgb(n * 3);
+    bool linear = false;
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t* p = src + i * ts;
+        float* o = &rgb[i * 3];
+        uint32_t v = 0;
+        memcpy(&v, p, std::min<uint32_t>(ts, 4));
+        float x;
+        switch (f) {
+            case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+                o[0] = p[0] / 255.f, o[1] = p[1] / 255.f, o[2] = p[2] / 255.f;
+                break;
+            case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+                o[0] = p[2] / 255.f, o[1] = p[1] / 255.f, o[2] = p[0] / 255.f;
+                break;
+            case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+                o[0] = (v & 1023) / 1023.f, o[1] = ((v >> 10) & 1023) / 1023.f, o[2] = ((v >> 20) & 1023) / 1023.f;
+                break;
+            case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+                o[2] = (v & 1023) / 1023.f, o[1] = ((v >> 10) & 1023) / 1023.f, o[0] = ((v >> 20) & 1023) / 1023.f;
+                break;
+            case VK_FORMAT_R8_UNORM: o[0] = o[1] = o[2] = p[0] / 255.f; break;
+            case VK_FORMAT_R8G8_UNORM: o[0] = p[0] / 255.f, o[1] = p[1] / 255.f, o[2] = 0; break;
+            case VK_FORMAT_R16_SFLOAT: o[0] = o[1] = o[2] = half(v & 0xffff), linear = true; break;
+            case VK_FORMAT_R16G16_SFLOAT: o[0] = half(v & 0xffff), o[1] = half(v >> 16), o[2] = 0, linear = true; break;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: {
+                uint16_t c[3];
+                memcpy(c, p, 6);
+                o[0] = half(c[0]), o[1] = half(c[1]), o[2] = half(c[2]), linear = true;
+                break;
+            }
+            case VK_FORMAT_R32G32B32A32_SFLOAT: memcpy(o, p, 12), linear = true; break;
+            case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+                o[0] = small_float(v & 2047, 6), o[1] = small_float((v >> 11) & 2047, 6), o[2] = small_float(v >> 22, 5);
+                linear = true;
+                break;
+            case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT:
+                memcpy(&x, p, 4), o[0] = o[1] = o[2] = x;
+                break;
+            case VK_FORMAT_D16_UNORM: o[0] = o[1] = o[2] = (v & 0xffff) / 65535.f; break;
+            default: o[0] = o[1] = o[2] = (v & 0xffffff) / 16777215.f; break;  // D24
+        }
+    }
+    if (is_depth(f)) {  // stretch: depth sits in a narrow band near one end
+        float lo = INFINITY, hi = -INFINITY;
+        for (size_t i = 0; i < n; i++) lo = std::min(lo, rgb[i * 3]), hi = std::max(hi, rgb[i * 3]);
+        float scale = hi > lo ? 1 / (hi - lo) : 0;
+        for (float& c : rgb) c = (c - lo) * scale;
+    }
+    std::vector<uint8_t> rgba(n * 4, 255);
+    for (size_t i = 0; i < n; i++)
+        for (int c = 0; c < 3; c++) {
+            float x = std::clamp(rgb[i * 3 + c], 0.f, 1.f);
+            if (linear) x = std::pow(x, 1 / 2.2f);
+            rgba[i * 4 + c] = uint8_t(x * 255 + 0.5f);
+        }
+    std::string png;
+    stbi_write_png_to_func(write_png, &png, (int)w, (int)h, 4, rgba.data(), (int)w * 4);
+    return png;
+}
+
+// --- recording, resolving
 
 std::string hex(const std::vector<uint8_t>& v) {
     static const char* digits = "0123456789abcdef";
@@ -397,6 +624,105 @@ std::string hex(const std::vector<uint8_t>& v) {
     }
     if (n < v.size()) s += " …";
     return s;
+}
+
+// Before each draw or dispatch: records it and applies the job of the frame, if any. False: skip the command.
+//   pick: the draw is clipped to the picked pixel (where its pipeline takes the scissor dynamically) and counted by
+//         an occlusion query, so the query says whether it wrote that pixel;
+//   scrub: the draws after the scrubbed one, in its pass, are skipped.
+bool begin_draw(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, Kind kind, uint32_t a, uint32_t b) {
+    CbState& s = state(d);
+    Rec& r = record(s, kind, a, b);
+    Job* job = g_job.load(std::memory_order_acquire);
+    if (!job) return true;
+    if (job->req.kind == Request::kScrub) {
+        if (kind < kDispatch && s.scrub_pass >= 0 && s.pass == s.scrub_pass) return false;
+        std::lock_guard lock(job->m);
+        if (job->found) return true;  // the job spans two frames: the first match only
+        bool hit = false;
+        if (r.key == job->req.anchor) {
+            job->counting = true, job->counted = 0;
+            hit = job->req.anchor == job->req.target;
+        } else if (job->counting && r.key == job->req.target) {
+            hit = job->counted++ == job->req.nth;
+        }
+        if (hit) {
+            job->found = true;
+            if (kind < kDispatch && s.pass >= 0) s.scrub_pass = s.pass;
+        }
+        return true;
+    }
+    if (kind >= kDispatch) return true;
+    if (s.job != job || s.queries >= kQueries) return true;  // begun before the job: no query pool
+    uint16_t dyn = 0;
+    {
+        std::shared_lock lock(g_objects);
+        if (auto it = g_pipelines.find(r.pipeline); it != g_pipelines.end()) dyn = it->second.dynamic;
+    }
+    if (dyn & (kScissor | kScissorCount)) {
+        VkViewport vp = s.viewport;  // the pixel in this draw's viewport (a negative height flips y with it)
+        if (vp.width == 0 && s.pass >= 0)
+            vp = {0, 0, (float)s.passes[s.pass].extent.width, (float)s.passes[s.pass].extent.height, 0, 1};
+        int32_t x = (int32_t)std::floor(vp.x + job->req.x * vp.width);
+        int32_t y = (int32_t)std::floor(vp.y + job->req.y * vp.height);
+        const VkRect2D& sc = s.scissor;
+        bool inside = x >= std::max(sc.offset.x, 0) && y >= std::max(sc.offset.y, 0) &&
+                      x < sc.offset.x + (int32_t)sc.extent.width && y < sc.offset.y + (int32_t)sc.extent.height;
+        VkRect2D px = inside ? VkRect2D{{x, y}, {1, 1}} : VkRect2D{{0, 0}, {0, 0}};
+        if (dyn & kScissorCount) {
+            if (s.scissor_ext) d.CmdSetScissorWithCountEXT(cb, 1, &px);
+            else d.CmdSetScissorWithCount(cb, 1, &px);
+            s.clipped = 2;
+        } else {
+            d.CmdSetScissor(cb, 0, 1, &px);
+            s.clipped = 1;
+        }
+    }
+    r.pool = s.pool, r.query = s.queries++;
+    d.CmdBeginQuery(cb, r.pool, r.query, 0);
+    s.in_query = true;
+    return true;
+}
+
+void end_draw(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
+    CbState& s = state(d);
+    if (!s.in_query) return;
+    d.CmdEndQuery(cb, s.recs.back().pool, s.recs.back().query);
+    if (s.clipped == 2) {
+        if (s.scissor_ext) d.CmdSetScissorWithCountEXT(cb, 1, &s.scissor);
+        else d.CmdSetScissorWithCount(cb, 1, &s.scissor);
+    } else if (s.clipped == 1) {
+        d.CmdSetScissor(cb, 0, 1, &s.scissor);
+    }
+    s.in_query = false, s.clipped = 0;
+}
+
+// After a pass ends: in a scrub frame, the scrubbed draw's target is copied out here (outside the pass).
+void end_pass(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
+    CbState& s = state(d);
+    int pass = s.pass;
+    s.pass = -1;
+    Job* job = g_job.load(std::memory_order_acquire);
+    if (!job || pass < 0 || pass != s.scrub_pass) return;
+    s.scrub_pass = -1;
+    const PassRec& p = s.passes[pass];
+    std::lock_guard lock(job->m);
+    if (job->copied) return;
+    job->copied = true;
+    uint32_t ts = texel_size(p.info.format);
+    if (!p.image) job->error = "Its target is not known: scrubbing draws in render pass objects isn't supported yet.";
+    else if (p.info.samples != VK_SAMPLE_COUNT_1_BIT) job->error = "Its target is multisampled; Fixframe can't show those yet.";
+    else if (!ts) job->error = "Fixframe can't show its target's format (" + strip(string_VkFormat(p.info.format), "VK_FORMAT_") + ") yet.";
+    if (!job->error.empty()) return;
+    auto* rb = new Readback;
+    if (!rb->create(*d.pDeviceDispatch, VkDeviceSize(ts) * p.info.extent.width * p.info.extent.height)) {
+        rb->destroy();
+        delete rb;
+        job->error = "No host-visible memory for the copy.";
+        return;
+    }
+    record_copy(*d.pDeviceDispatch, cb, p.image, p.aspect, p.layout, p.info.extent, rb->buffer);
+    job->target = rb, job->format = p.info.format, job->extent = {p.info.extent.width, p.info.extent.height};
 }
 
 uint64_t add_texture(Capture& c, VkImageView view) {  // g_objects held
@@ -426,7 +752,7 @@ bool view_is_depth(VkImageView view) {  // g_objects held
 }
 
 // Appends one submitted command buffer's records to the capture. inherit_pass: the primary's pass for a
-// secondary's draws. g_objects held (shared).
+// secondary's draws. g_objects held (shared), g_capture_mutex held.
 void resolve(Capture& c, VkCommandBuffer cb, int inherit_pass) {
     auto* d = vkroots::LookupDispatch(cb);
     if (!d || !d->UserData.has()) return;
@@ -450,6 +776,7 @@ void resolve(Capture& c, VkCommandBuffer cb, int inherit_pass) {
         }
         Draw out;
         out.kind = kKindNames[r.kind];
+        out.key = r.key;
         out.count = r.a, out.instances = r.b;
         out.pass = r.kind >= kDispatch ? -1 : pass;
         out.label = label_text(r.label);
@@ -484,6 +811,7 @@ void resolve(Capture& c, VkCommandBuffer cb, int inherit_pass) {
                     out.textures.push_back({slot(k >> 48, (k >> 32) & 0xffff, k & 0xffffffff), std::to_string(t)});
         }
         c.draws.push_back(std::move(out));
+        if (c.picked) g_pick_slots.push_back({r.pool, r.query});
     }
 }
 
@@ -507,56 +835,8 @@ void submitted(const VkCommandBuffer* cbs, uint32_t count) {
     for (uint32_t i = 0; i < count; i++) resolve(*g_building, cbs[i], -1);
 }
 
-// ---------------------------------------------------------------------------------------------------------
-// Reading the presented image back (only for a captured frame). The copy is submitted on the present queue,
-// waiting for what the present waited for; the present then waits for the copy.
-
-struct DeviceInfo {
-    VkPhysicalDevice gpu = VK_NULL_HANDLE;
-    VkPhysicalDeviceMemoryProperties memory{};
-    std::unordered_map<VkQueue, uint32_t> queue_family;
-};
-DeviceInfo g_device;
-
-void write_png(void* ctx, void* data, int size) { static_cast<std::string*>(ctx)->append((const char*)data, size); }
-
-std::string encode(const uint8_t* src, VkFormat format, uint32_t w, uint32_t h) {
-    std::vector<uint8_t> rgba(size_t(w) * h * 4);
-    for (size_t i = 0; i < size_t(w) * h; i++) {
-        const uint8_t* p = src + i * 4;
-        uint8_t* o = &rgba[i * 4];
-        switch (format) {
-            case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
-                o[0] = p[2], o[1] = p[1], o[2] = p[0];
-                break;
-            case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
-                o[0] = p[0], o[1] = p[1], o[2] = p[2];
-                break;
-            case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
-                uint32_t v;
-                memcpy(&v, p, 4);
-                uint8_t r = (v & 1023) >> 2, g = ((v >> 10) & 1023) >> 2, b = ((v >> 20) & 1023) >> 2;
-                bool abgr = format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-                o[0] = abgr ? r : b, o[1] = g, o[2] = abgr ? b : r;
-                break;
-            }
-            default:
-                return {};
-        }
-        o[3] = 255;
-    }
-    std::string png;
-    stbi_write_png_to_func(write_png, &png, (int)w, (int)h, 4, rgba.data(), (int)w * 4);
-    return png;
-}
-
-bool readable_format(VkFormat f) {
-    return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_UNORM ||
-           f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-           f == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-}
-
-// Presents with the swapchain image copied to the host first; png gets the image (empty on failure).
+// Presents with the swapchain image copied to the host first; png gets the image (empty on failure). The copy is
+// submitted on the present queue, waiting for what the present waited for; the present then waits for the copy.
 VkResult present_with_readback(const vkroots::VkQueueDispatch& qd, VkQueue queue, const VkPresentInfoKHR* info,
                                std::string& png) {
     const vkroots::VkDeviceDispatch& d = *qd.pDeviceDispatch;
@@ -570,13 +850,10 @@ VkResult present_with_readback(const vkroots::VkQueueDispatch& qd, VkQueue queue
     }
     uint32_t index = info->pImageIndices[0];
     auto family = g_device.queue_family.find(queue);
-    if (!sc.readable || !readable_format(sc.format) || index >= sc.images.size() || family == g_device.queue_family.end())
+    if (!sc.readable || !texel_size(sc.format) || index >= sc.images.size() || family == g_device.queue_family.end())
         return qd.QueuePresentKHR(queue, info);
-    VkImage image = sc.images[index];
-    VkDeviceSize size = VkDeviceSize(sc.extent.width) * sc.extent.height * 4;
 
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    Readback rb;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkSemaphore done = VK_NULL_HANDLE;
@@ -585,59 +862,27 @@ VkResult present_with_readback(const vkroots::VkQueueDispatch& qd, VkQueue queue
         if (fence) d.DestroyFence(dev, fence, nullptr);
         if (done) d.DestroySemaphore(dev, done, nullptr);
         if (pool) d.DestroyCommandPool(dev, pool, nullptr);
-        if (buffer) d.DestroyBuffer(dev, buffer, nullptr);
-        if (memory) d.FreeMemory(dev, memory, nullptr);
+        rb.destroy();
     };
-
-    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = size;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VkMemoryRequirements req;
-    uint32_t type = UINT32_MAX;
-    if (d.CreateBuffer(dev, &bci, nullptr, &buffer) == VK_SUCCESS) {
-        d.GetBufferMemoryRequirements(dev, buffer, &req);
-        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        for (uint32_t i = 0; i < g_device.memory.memoryTypeCount && type == UINT32_MAX; i++)
-            if ((req.memoryTypeBits & (1u << i)) && (g_device.memory.memoryTypes[i].propertyFlags & want) == want) type = i;
-    }
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, type};
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, 0, family->second};
     VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (type == UINT32_MAX || d.AllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS ||
-        d.BindBufferMemory(dev, buffer, memory, 0) != VK_SUCCESS ||
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, VK_NULL_HANDLE,
+                                    VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    if (!rb.create(d, VkDeviceSize(texel_size(sc.format)) * sc.extent.width * sc.extent.height) ||
         d.CreateCommandPool(dev, &pci, nullptr, &pool) != VK_SUCCESS ||
-        d.CreateSemaphore(dev, &sci, nullptr, &done) != VK_SUCCESS || d.CreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) {
+        d.CreateSemaphore(dev, &sci, nullptr, &done) != VK_SUCCESS || d.CreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS ||
+        (cai.commandPool = pool, d.AllocateCommandBuffers(dev, &cai, &cb)) != VK_SUCCESS) {
         cleanup();
         return qd.QueuePresentKHR(queue, info);
     }
-    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, pool,
-                                    VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
-    d.AllocateCommandBuffers(dev, &cai, &cb);
     *reinterpret_cast<void**>(cb) = *reinterpret_cast<void**>(dev);  // a layer's own dispatchable object: the loader's table
 
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
                                    VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     d.BeginCommandBuffer(cb, &begin);
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &barrier);
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {sc.extent.width, sc.extent.height, 1};
-    d.CmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
-    std::swap(barrier.oldLayout, barrier.newLayout);
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    barrier.dstAccessMask = 0;
-    d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &barrier);
+    record_copy(d, cb, sc.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                {sc.extent.width, sc.extent.height, 1}, rb.buffer);
     d.EndCommandBuffer(cb);
 
     std::vector<VkPipelineStageFlags> stages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -657,15 +902,20 @@ VkResult present_with_readback(const vkroots::VkQueueDispatch& qd, VkQueue queue
         waited.waitSemaphoreCount = 1;
         waited.pWaitSemaphores = &done;
         result = qd.QueuePresentKHR(queue, &waited);
-        void* mapped = nullptr;
-        if (d.WaitForFences(dev, 1, &fence, VK_TRUE, 5'000'000'000ull) == VK_SUCCESS &&
-            d.MapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-            png = encode(static_cast<const uint8_t*>(mapped), sc.format, sc.extent.width, sc.extent.height);
-            d.UnmapMemory(dev, memory);
-        }
+        if (d.WaitForFences(dev, 1, &fence, VK_TRUE, 5'000'000'000ull) == VK_SUCCESS)
+            if (const uint8_t* p = rb.map()) png = picture(sc.format, p, sc.extent.width, sc.extent.height);
     }
     cleanup();
     return result;
+}
+
+void retire(const vkroots::VkDeviceDispatch& d, uint64_t frame) {  // present thread
+    std::erase_if(g_retired, [&](std::unique_ptr<Job>& j) {
+        if (j->retire_at > frame) return false;
+        for (VkQueryPool p : j->pools) d.DestroyQueryPool(d.Device, p, nullptr);
+        if (j->target) j->target->destroy(), delete j->target;
+        return true;
+    });
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -830,7 +1080,7 @@ struct Device {
         VkResult r = d.CreateImage(dev, info, alloc, image);
         if (r == VK_SUCCESS) {
             std::unique_lock lock(g_objects);
-            g_images[*image] = {info->format, info->extent, info->mipLevels, info->arrayLayers};
+            g_images[*image] = {info->format, info->extent, info->mipLevels, info->arrayLayers, info->samples};
         }
         return r;
     }
@@ -948,7 +1198,22 @@ struct Device {
     static VkResult BeginCommandBuffer(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                        const VkCommandBufferBeginInfo* info) {
         state(d).reset();
-        return d.BeginCommandBuffer(cb, info);
+        VkResult r = d.BeginCommandBuffer(cb, info);
+        Job* job = g_job.load(std::memory_order_acquire);
+        if (r == VK_SUCCESS && job && job->req.kind == Request::kPick && !info->pInheritanceInfo) {
+            // a pick frame: this command buffer's draws are counted by queries of its own pool
+            const vkroots::VkDeviceDispatch& dd = *d.pDeviceDispatch;
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_OCCLUSION, kQueries};
+            VkQueryPool pool;
+            if (dd.CreateQueryPool(dd.Device, &qci, nullptr, &pool) == VK_SUCCESS) {
+                d.CmdResetQueryPool(cb, pool, 0, kQueries);
+                CbState& s = state(d);
+                s.pool = pool, s.job = job;
+                std::lock_guard lock(job->m);
+                job->pools.push_back(pool);
+            }
+        }
+        return r;
     }
     static VkResult ResetCommandBuffer(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                        VkCommandBufferResetFlags flags) {
@@ -1020,6 +1285,7 @@ struct Device {
     static void CmdSetScissorWithCountEXT(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                           uint32_t count, const VkRect2D* r) {
         if (count) state(d).scissor = r[0];
+        state(d).scissor_ext = true;
         d.CmdSetScissorWithCountEXT(cb, count, r);
     }
 
@@ -1034,12 +1300,12 @@ struct Device {
         d.CmdBeginRenderingKHR(cb, info);
     }
     static void CmdEndRendering(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
-        state(d).pass = -1;
         d.CmdEndRendering(cb);
+        end_pass(d, cb);
     }
     static void CmdEndRenderingKHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
-        state(d).pass = -1;
         d.CmdEndRenderingKHR(cb);
+        end_pass(d, cb);
     }
     static void CmdBeginRenderPass(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                    const VkRenderPassBeginInfo* info, VkSubpassContents contents) {
@@ -1057,18 +1323,18 @@ struct Device {
         d.CmdBeginRenderPass2KHR(cb, info, sub);
     }
     static void CmdEndRenderPass(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
-        state(d).pass = -1;
         d.CmdEndRenderPass(cb);
+        end_pass(d, cb);
     }
     static void CmdEndRenderPass2(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                   const VkSubpassEndInfo* info) {
-        state(d).pass = -1;
         d.CmdEndRenderPass2(cb, info);
+        end_pass(d, cb);
     }
     static void CmdEndRenderPass2KHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                      const VkSubpassEndInfo* info) {
-        state(d).pass = -1;
         d.CmdEndRenderPass2KHR(cb, info);
+        end_pass(d, cb);
     }
 
     static void CmdBeginDebugUtilsLabelEXT(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
@@ -1103,57 +1369,57 @@ struct Device {
 
     static void CmdDraw(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, uint32_t vertices,
                         uint32_t instances, uint32_t firstVertex, uint32_t firstInstance) {
-        record(d, kDraw, vertices, instances);
-        d.CmdDraw(cb, vertices, instances, firstVertex, firstInstance);
+        if (begin_draw(d, cb, kDraw, vertices, instances)) d.CmdDraw(cb, vertices, instances, firstVertex, firstInstance);
+        end_draw(d, cb);
     }
     static void CmdDrawIndexed(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, uint32_t indices,
                                uint32_t instances, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
-        record(d, kIndexed, indices, instances);
-        d.CmdDrawIndexed(cb, indices, instances, firstIndex, vertexOffset, firstInstance);
+        if (begin_draw(d, cb, kIndexed, indices, instances)) d.CmdDrawIndexed(cb, indices, instances, firstIndex, vertexOffset, firstInstance);
+        end_draw(d, cb);
     }
     static void CmdDrawIndirect(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkBuffer buffer,
                                 VkDeviceSize offset, uint32_t count, uint32_t stride) {
-        record(d, kIndirect, count, 0);
-        d.CmdDrawIndirect(cb, buffer, offset, count, stride);
+        if (begin_draw(d, cb, kIndirect, count, 0)) d.CmdDrawIndirect(cb, buffer, offset, count, stride);
+        end_draw(d, cb);
     }
     static void CmdDrawIndexedIndirect(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkBuffer buffer,
                                        VkDeviceSize offset, uint32_t count, uint32_t stride) {
-        record(d, kIndexedIndirect, count, 0);
-        d.CmdDrawIndexedIndirect(cb, buffer, offset, count, stride);
+        if (begin_draw(d, cb, kIndexedIndirect, count, 0)) d.CmdDrawIndexedIndirect(cb, buffer, offset, count, stride);
+        end_draw(d, cb);
     }
     static void CmdDrawIndirectCount(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkBuffer buffer,
                                      VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset,
                                      uint32_t maxCount, uint32_t stride) {
-        record(d, kIndirectCount, maxCount, 0);
-        d.CmdDrawIndirectCount(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        if (begin_draw(d, cb, kIndirectCount, maxCount, 0)) d.CmdDrawIndirectCount(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        end_draw(d, cb);
     }
     static void CmdDrawIndirectCountKHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkBuffer buffer,
                                         VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset,
                                         uint32_t maxCount, uint32_t stride) {
-        record(d, kIndirectCount, maxCount, 0);
-        d.CmdDrawIndirectCountKHR(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        if (begin_draw(d, cb, kIndirectCount, maxCount, 0)) d.CmdDrawIndirectCountKHR(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        end_draw(d, cb);
     }
     static void CmdDrawIndexedIndirectCount(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                             VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer,
                                             VkDeviceSize countOffset, uint32_t maxCount, uint32_t stride) {
-        record(d, kIndexedIndirectCount, maxCount, 0);
-        d.CmdDrawIndexedIndirectCount(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        if (begin_draw(d, cb, kIndexedIndirectCount, maxCount, 0)) d.CmdDrawIndexedIndirectCount(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        end_draw(d, cb);
     }
     static void CmdDrawIndexedIndirectCountKHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                                VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer,
                                                VkDeviceSize countOffset, uint32_t maxCount, uint32_t stride) {
-        record(d, kIndexedIndirectCount, maxCount, 0);
-        d.CmdDrawIndexedIndirectCountKHR(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        if (begin_draw(d, cb, kIndexedIndirectCount, maxCount, 0)) d.CmdDrawIndexedIndirectCountKHR(cb, buffer, offset, countBuffer, countOffset, maxCount, stride);
+        end_draw(d, cb);
     }
     static void CmdDispatch(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, uint32_t x, uint32_t y,
                             uint32_t z) {
-        record(d, kDispatch, x, y);
-        d.CmdDispatch(cb, x, y, z);
+        if (begin_draw(d, cb, kDispatch, x, y)) d.CmdDispatch(cb, x, y, z);
+        end_draw(d, cb);
     }
     static void CmdDispatchIndirect(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkBuffer buffer,
                                     VkDeviceSize offset) {
-        record(d, kDispatchIndirect, 0, 0);
-        d.CmdDispatchIndirect(cb, buffer, offset);
+        if (begin_draw(d, cb, kDispatchIndirect, 0, 0)) d.CmdDispatchIndirect(cb, buffer, offset);
+        end_draw(d, cb);
     }
     static void CmdExecuteCommands(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, uint32_t count,
                                    const VkCommandBuffer* secondaries) {
@@ -1192,24 +1458,77 @@ struct Device {
         return d.QueueSubmit2KHR(queue, count, submits, fence);
     }
 
+    // Frame boundaries: a capture or job armed here covers the frame recorded and submitted until the next
+    // present, where its results are read back.
     static VkResult QueuePresentKHR(const vkroots::VkQueueDispatch& d, VkQueue queue, const VkPresentInfoKHR* info) {
         uint64_t frame = ++g_frame;
         core::frame_done(frame, g_frame_draws.exchange(0));
         std::unique_ptr<Capture> done;
+        std::unique_ptr<Job> job;
+        std::vector<std::pair<VkQueryPool, uint32_t>> slots;
         {
             std::lock_guard lock(g_capture_mutex);
-            done = std::move(g_building);  // the frame captured ends with this present
-            if (!done && core::take_capture_request()) {
+            auto arm_capture = [&](const Request& req) {
                 g_building = std::make_unique<Capture>();
                 g_building->frame = frame + 1;
+                g_building->picked = req.kind == Request::kPick;
+                g_building->pick_x = req.x, g_building->pick_y = req.y;
+            };
+            Request req;
+            if (g_running && ++g_running->presents == 1) {
+                if (g_running->req.kind == Request::kPick) arm_capture(g_running->req);
+            } else if (g_running) {  // the job's frame is submitted: read it back
+                done = std::move(g_building);
+                slots = std::move(g_pick_slots);
+                job = std::move(g_running);
+                g_job = nullptr;
+            } else if (g_building) {  // a plain capture: the frame since the last present
+                done = std::move(g_building);
+            } else if (core::take_request(req)) {
+                if (req.kind == Request::kCapture) {
+                    arm_capture(req);
+                } else {
+                    g_running = std::make_unique<Job>();
+                    g_running->req = req;
+                    g_job = g_running.get();
+                }
             }
         }
-        if (!done) return d.QueuePresentKHR(queue, info);
-        VkResult r = present_with_readback(d, queue, info, done->png);
-        fprintf(stderr, "[fixframe] captured frame %llu: %zu draws, %zu passes, %zu textures%s\n",
-                (unsigned long long)done->frame, done->draws.size(), done->passes.size(), done->textures.size(),
-                done->png.empty() ? ", no image" : "");
-        core::publish(std::move(done));
+        const vkroots::VkDeviceDispatch& dd = *d.pDeviceDispatch;
+        retire(dd, frame);
+        if (!done && !job) return d.QueuePresentKHR(queue, info);
+
+        // a pick frame's image is the pixel alone: not worth reading back
+        VkResult r = done && !done->picked ? present_with_readback(d, queue, info, done->png) : d.QueuePresentKHR(queue, info);
+        if (job) d.QueueWaitIdle(queue);  // the job's frame is done (on this queue)
+        if (done && done->picked)
+            for (size_t i = 0; i < slots.size() && i < done->draws.size(); i++) {
+                if (!slots[i].first) continue;
+                uint64_t v[2] = {};  // samples, availability
+                if (dd.GetQueryPoolResults(dd.Device, slots[i].first, slots[i].second, 1, sizeof v, v, sizeof v,
+                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS &&
+                    v[1])
+                    done->draws[i].samples = (int64_t)v[0];
+            }
+        if (job && job->req.kind == Request::kScrub) {
+            std::string png, error = job->error;
+            if (!job->found) error = "That draw was not recorded in the next frame (the frame changed): capture again.";
+            else if (error.empty() && !job->target) error = "Its pass did not end in the same command buffer.";
+            else if (error.empty())
+                if (const uint8_t* p = job->target->map()) png = picture(job->format, p, job->extent.width, job->extent.height);
+            if (png.empty() && error.empty()) error = "The copy could not be read.";
+            core::scrubbed(std::move(png), std::move(error));
+        }
+        if (done) {
+            fprintf(stderr, "[fixframe] %s frame %llu: %zu draws, %zu passes, %zu textures%s\n",
+                    done->picked ? "picked" : "captured", (unsigned long long)done->frame, done->draws.size(),
+                    done->passes.size(), done->textures.size(), done->png.empty() ? ", no image" : "");
+            core::publish(std::move(done));
+        }
+        if (job) {
+            job->retire_at = frame + 3;
+            g_retired.push_back(std::move(job));
+        }
         return r;
     }
 };

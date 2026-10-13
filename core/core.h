@@ -46,6 +46,8 @@ struct Pass {
 
 struct Draw {
     std::string kind;  // draw, indexed, indirect, indexed-indirect, indirect-count, ..., dispatch
+    uint64_t key = 0;  // signature (program, counts, label): with its place, how a later frame finds the same draw
+    int64_t samples = -1;  // pick captures: samples it wrote at the picked pixel (-1: not measured)
     uint32_t count = 0, instances = 0;
     int pass = -1;  // index in Capture::passes, -1 outside a pass (dispatches)
     std::string label;
@@ -61,6 +63,19 @@ struct Capture {
     std::vector<Draw> draws;
     std::map<uint64_t, Texture> textures;
     std::string png;  // the presented image, empty if it could not be read back
+    bool picked = false;  // a pick capture: draws carry samples at (pick_x, pick_y), 0..1 of the image
+    float pick_x = 0, pick_y = 0;
+};
+
+// What the UI asks a backend to do with its next frame.
+struct Request {
+    enum Kind { kCapture, kPick, kScrub } kind = kCapture;
+    float x = 0, y = 0;     // kPick: the pixel, 0..1 of the presented image
+    // kScrub: the draw with key `target`, the `nth` (from 0) after the anchor: the nearest draw before it whose key is
+    // unique in the frame (or itself, when its key is unique). Frames gain and lose draws (particles, culling);
+    // counting only the target's own key from a close anchor finds it anyway.
+    uint64_t anchor = 0, target = 0;
+    uint32_t nth = 0;
 };
 
 namespace core {
@@ -69,10 +84,12 @@ namespace core {
 void start(const std::string& app, const std::string& device, const std::string& backend);
 // Backends, once a frame: the frame just presented and the draws it submitted.
 void frame_done(uint64_t frame, uint32_t draws);
-// Backends, at a frame boundary: true once per capture asked for (the UI's Capture button).
-bool take_capture_request();
-// Backends: a finished capture; core numbers it and keeps the newest few.
+// Backends, at a frame boundary: the request to carry out with the next frame, if any.
+bool take_request(Request& out);
+// Backends: a finished capture (kCapture, kPick); core numbers it and keeps the newest few.
 void publish(std::unique_ptr<Capture> capture);
+// Backends: a finished scrub: the target after the draw as a PNG, or why there is none.
+void scrubbed(std::string png, std::string error);
 
 }  // namespace core
 }  // namespace fixframe

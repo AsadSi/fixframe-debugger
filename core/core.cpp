@@ -21,7 +21,12 @@ std::string g_app, g_device, g_backend;
 uint64_t g_frame = 0;
 uint32_t g_draws = 0;
 std::deque<double> g_times;  // present times of the last second, for the frame rate
-bool g_request = false;
+// One request at a time: the server thread waits for its result (g_done counts results).
+bool g_pending = false, g_taken = false;  // asked for; handed to the backend
+Request g_request;
+uint64_t g_done = 0;
+uint32_t g_result_capture = 0;  // kCapture, kPick
+std::string g_result_png, g_result_error;  // kScrub
 uint32_t g_next_id = 1;
 std::deque<std::shared_ptr<const Capture>> g_captures;  // newest last
 constexpr size_t kKeep = 8;
@@ -59,7 +64,9 @@ std::string id(uint64_t v) { return '"' + std::to_string(v) + '"'; }
 
 std::string capture_json(const Capture& c) {
     std::string o = "{\"id\":" + std::to_string(c.id) + ",\"frame\":" + std::to_string(c.frame) +
-                    ",\"image\":" + (c.png.empty() ? "false" : "true") + ",\"passes\":[";
+                    ",\"image\":" + (c.png.empty() ? "false" : "true") + ",\"pick\":" +
+                    (c.picked ? "[" + std::to_string(c.pick_x) + "," + std::to_string(c.pick_y) + "]" : "null") +
+                    ",\"passes\":[";
     for (size_t i = 0; i < c.passes.size(); i++) {
         const Pass& p = c.passes[i];
         if (i) o += ',';
@@ -115,7 +122,7 @@ std::string capture_json(const Capture& c) {
         if (i) o += ',';
         o += "{\"kind\":";
         str(o, d.kind);
-        o += ",\"count\":" + std::to_string(d.count) + ",\"instances\":" + std::to_string(d.instances) +
+        o += ",\"key\":" + id(d.key) + ",\"samples\":" + std::to_string(d.samples) + ",\"count\":" + std::to_string(d.count) + ",\"instances\":" + std::to_string(d.instances) +
              ",\"pass\":" + std::to_string(d.pass) + ",\"label\":";
         str(o, d.label);
         o += ",\"program\":" + (d.program ? id(d.program->id) : std::string("null")) + ",\"dynamic\":";
@@ -125,6 +132,37 @@ std::string capture_json(const Capture& c) {
         o += '}';
     }
     return o + "]}";
+}
+
+// Hands a request to the backend and waits for its result (a few frames). False on a timeout or when another
+// request is still running; res then holds the error.
+bool run(const Request& r, httplib::Response& res, std::unique_lock<std::mutex>& lock) {
+    if (g_pending || g_taken) {  // taken: the backend is still on an earlier one (even one that timed out)
+        res.status = 409;
+        res.set_content("{\"error\":\"another request is still running\"}", "application/json");
+        return false;
+    }
+    uint64_t before = g_done;
+    g_request = r, g_pending = true;
+    if (!g_published.wait_for(lock, std::chrono::seconds(15), [&] { return g_done != before; })) {
+        g_pending = false;
+        res.status = 504;
+        res.set_content("{\"error\":\"the game presented no frames for 15 s\"}", "application/json");
+        return false;
+    }
+    return true;
+}
+
+void finished() {  // g_mutex held
+    g_pending = false;
+    g_done++;
+    g_published.notify_all();
+}
+
+std::shared_ptr<const Capture> find_locked(int capture_id) {
+    for (auto& c : g_captures)
+        if ((int)c->id == capture_id) return c;
+    return nullptr;
 }
 
 std::shared_ptr<const Capture> find(int capture_id) {
@@ -178,16 +216,46 @@ void serve() {
     });
     server.Post("/api/capture", [](const httplib::Request&, httplib::Response& res) {
         std::unique_lock lock(g_mutex);
-        uint32_t before = g_next_id;
-        g_request = true;
-        // two presents at most; a game at a few frames a second still makes it
-        if (!g_published.wait_for(lock, std::chrono::seconds(10), [&] { return g_next_id != before; })) {
-            g_request = false;
-            res.status = 504;
-            res.set_content("{\"error\":\"no frame was presented in 10 s\"}", "application/json");
+        if (run({Request::kCapture}, res, lock))
+            res.set_content("{\"id\":" + std::to_string(g_result_capture) + '}', "application/json");
+    });
+    // A pick: a new capture whose draws carry the samples they wrote at x, y (0..1 of the image).
+    server.Post("/api/pick", [](const httplib::Request& req, httplib::Response& res) {
+        Request r{Request::kPick};
+        r.x = std::stof(req.get_param_value("x").empty() ? "0" : req.get_param_value("x"));
+        r.y = std::stof(req.get_param_value("y").empty() ? "0" : req.get_param_value("y"));
+        std::unique_lock lock(g_mutex);
+        if (run(r, res, lock))
+            res.set_content("{\"id\":" + std::to_string(g_result_capture) + '}', "application/json");
+    });
+    // A scrub: the target of a capture's draw as it is right after that draw, from a new frame.
+    server.Post(R"(/api/captures/(\d+)/draws/(\d+)/target)", [](const httplib::Request& req, httplib::Response& res) {
+        std::unique_lock lock(g_mutex);
+        auto c = find_locked(std::stoi(req.matches[1]));
+        size_t i = std::stoul(req.matches[2]);
+        if (!c || i >= c->draws.size()) { res.status = 404; return; }
+        std::map<uint64_t, int> seen;
+        for (const Draw& d : c->draws) seen[d.key]++;
+        size_t anchor = i;
+        while (anchor > 0 && seen[c->draws[anchor].key] != 1) anchor--;
+        if (seen[c->draws[anchor].key] != 1) {
+            res.status = 422;
+            res.set_content("{\"error\":\"Nothing before this draw is unique enough in the frame to find it again.\"}",
+                            "application/json");
             return;
         }
-        res.set_content("{\"id\":" + std::to_string(g_captures.back()->id) + '}', "application/json");
+        Request r{Request::kScrub};
+        r.anchor = c->draws[anchor].key, r.target = c->draws[i].key;
+        for (size_t j = anchor + 1; j < i; j++) r.nth += c->draws[j].key == r.target;
+        if (!run(r, res, lock)) return;
+        if (g_result_png.empty()) {
+            res.status = 422;
+            std::string o = "{\"error\":";
+            str(o, g_result_error);
+            res.set_content(o + '}', "application/json");
+            return;
+        }
+        res.set_content(g_result_png, "image/png");
     });
     server.Get(R"(/api/captures/(\d+))", [](const httplib::Request& req, httplib::Response& res) {
         auto c = find(std::stoi(req.matches[1]));
@@ -225,21 +293,29 @@ void frame_done(uint64_t frame, uint32_t draws) {
     while (g_times.front() < t - 1.0) g_times.pop_front();
 }
 
-bool take_capture_request() {
+bool take_request(Request& out) {
     std::lock_guard lock(g_mutex);
-    bool r = g_request;
-    g_request = false;
-    return r;
+    if (!g_pending || g_taken) return false;
+    g_taken = true;
+    out = g_request;
+    return true;
 }
 
 void publish(std::unique_ptr<Capture> capture) {
-    {
-        std::lock_guard lock(g_mutex);
-        capture->id = g_next_id++;
-        g_captures.push_back(std::move(capture));
-        if (g_captures.size() > kKeep) g_captures.pop_front();
-    }
-    g_published.notify_all();
+    std::lock_guard lock(g_mutex);
+    capture->id = g_next_id++;
+    g_result_capture = capture->id;
+    g_captures.push_back(std::move(capture));
+    if (g_captures.size() > kKeep) g_captures.pop_front();
+    g_taken = false;
+    finished();
+}
+
+void scrubbed(std::string png, std::string error) {
+    std::lock_guard lock(g_mutex);
+    g_result_png = std::move(png), g_result_error = std::move(error);
+    g_taken = false;
+    finished();
 }
 
 }  // namespace fixframe::core
