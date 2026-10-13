@@ -48,6 +48,7 @@ struct Draw {
     std::string kind;  // draw, indexed, indirect, indexed-indirect, indirect-count, ..., dispatch
     uint64_t key = 0;  // signature (program, counts, label): with its place, how a later frame finds the same draw
     int64_t samples = -1;  // pick captures: samples it wrote at the picked pixel (-1: not measured)
+    bool approximate = false;  // pick captures: samples counted over the whole draw, not just the pixel
     uint32_t count = 0, instances = 0;
     int pass = -1;  // index in Capture::passes, -1 outside a pass (dispatches)
     std::string label;
@@ -55,6 +56,7 @@ struct Draw {
     std::shared_ptr<const Program> program;
     std::vector<KV> dynamic;   // viewport, scissor, push constants: state set per draw
     std::vector<KV> textures;  // slot ("set 0 binding 3") -> Texture id (decimal)
+    std::vector<KV> samplers;  // slot -> how it is sampled (filter, wrap, lod, ...)
 };
 
 struct Capture {

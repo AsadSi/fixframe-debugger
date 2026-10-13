@@ -57,6 +57,7 @@ button.quiet, a.button { background: transparent; color: var(--accent); border: 
 .diff td { padding-right: 8px; }
 .diff th { text-align: left; color: var(--muted); font-weight: 600; padding: 3px 8px 3px 0; }
 .draw .a { color: var(--accent); font-weight: 700; flex: none; }
+.problems { margin: 0; padding-left: 18px; color: #d9534f; }
 .toggle { display: flex; gap: 6px; align-items: center; margin: 0 8px 8px; color: var(--muted); }
 .draw .hit { color: var(--accent); flex: none; }
 .empty { color: var(--muted); margin-top: 30vh; text-align: center; }

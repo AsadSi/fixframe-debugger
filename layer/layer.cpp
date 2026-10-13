@@ -18,6 +18,7 @@
 #include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "../core/core.h"
 
@@ -70,6 +71,29 @@ struct ImageInfo {
     VkExtent3D extent;
     uint32_t mips, layers;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    uint64_t serial = 0;  // unique per creation: the id captures use (the handle can be reused)
+};
+std::atomic<uint64_t> g_serial{1};
+
+// What a descriptor slot holds (images only: buffers are not shown yet).
+struct Slot {
+    VkImageView view = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    bool operator==(const Slot&) const = default;
+};
+
+struct RenderPassInfo {
+    std::vector<VkImageLayout> final_layout;  // per attachment: its layout after the pass
+    struct Subpass {
+        std::vector<uint32_t> colors;          // attachment indices (VK_ATTACHMENT_UNUSED kept: slot numbers)
+        uint32_t depth = VK_ATTACHMENT_UNUSED;
+    };
+    std::vector<Subpass> subpasses;
+};
+
+struct Template {
+    std::vector<VkDescriptorUpdateTemplateEntry> entries;
+    VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;  // push templates
 };
 struct SwapchainInfo {
     VkFormat format;
@@ -80,19 +104,23 @@ struct SwapchainInfo {
 
 // Dynamic state the layer follows, as bits; a pipeline's mask says which of them it takes from the command
 // buffer instead of its own create info. The keys match pipeline_state()'s, so a draw's values replace them.
-enum DynBit : uint16_t { kCull = 1, kFront = 2, kTopology = 4, kDepthTest = 8, kDepthWrite = 16, kDepthCompare = 32,
-                         kDepthBias = 64, kStencil = 128, kScissor = 256, kScissorCount = 512 };
+enum DynBit : uint32_t { kCull = 1, kFront = 2, kTopology = 4, kDepthTest = 8, kDepthWrite = 16, kDepthCompare = 32,
+                         kDepthBias = 64, kStencil = 128, kScissor = 256, kScissorCount = 512, kStencilCompareMask = 1024,
+                         kStencilWriteMask = 2048, kStencilRef = 4096, kStencilOp = 8192, kBlendConstants = 16384,
+                         kDepthBiasValues = 32768 };
 struct Dyn {
     VkCullModeFlags cull = 0;
     VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkCompareOp compare = VK_COMPARE_OP_NEVER;
     VkBool32 depth_test = 0, depth_write = 0, depth_bias = 0, stencil = 0;
+    VkStencilOpState face[2]{};  // front, back: ops, compare op, masks, reference as set dynamically
+    float blend[4]{}, bias[3]{};  // blend constants; depth bias constant, clamp, slope
 };
 
 struct PipelineRec {
     std::shared_ptr<const Program> program;  // replaced, not changed, when named: captures hold the old one
-    uint16_t dynamic = 0;
+    uint32_t dynamic = 0;
 };
 
 std::shared_mutex g_objects;
@@ -102,7 +130,11 @@ std::unordered_map<VkPipeline, PipelineRec> g_pipelines;
 std::unordered_map<VkImage, ImageInfo> g_images;
 std::unordered_map<VkImageView, VkImage> g_views;
 std::unordered_map<VkFramebuffer, std::vector<VkImageView>> g_framebuffers;
-std::unordered_map<VkDescriptorSet, std::map<uint64_t, VkImageView>> g_sets;  // (binding << 32 | element) -> view
+std::unordered_map<VkDescriptorSet, std::map<uint64_t, Slot>> g_sets;  // (binding << 32 | element) -> what it holds
+std::unordered_map<VkDescriptorPool, std::unordered_set<VkDescriptorSet>> g_pool_sets;
+std::unordered_map<VkDescriptorUpdateTemplate, Template> g_templates;
+std::unordered_map<VkRenderPass, std::shared_ptr<const RenderPassInfo>> g_render_passes;
+std::unordered_map<VkSampler, std::string> g_samplers;  // summary, as the inspector shows it
 std::unordered_map<VkSwapchainKHR, SwapchainInfo> g_swapchains;
 
 std::string name_of(uint64_t handle) {
@@ -120,9 +152,10 @@ bool is_depth(VkFormat f) {
     }
 }
 
+// Descriptors whose VkDescriptorImageInfo the layer keeps: images and samplers (alone or combined).
 bool is_image_descriptor(VkDescriptorType t) {
     return t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
-           t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+           t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || t == VK_DESCRIPTOR_TYPE_SAMPLER;
 }
 
 const char* stage_name(VkShaderStageFlagBits s) {
@@ -152,8 +185,8 @@ std::string cull_text(VkCullModeFlags c) {
 }
 std::string on(VkBool32 b) { return b ? "on" : "off"; }
 
-uint16_t dynamic_mask(const VkPipelineDynamicStateCreateInfo* dy) {
-    uint16_t m = 0;
+uint32_t dynamic_mask(const VkPipelineDynamicStateCreateInfo* dy) {
+    uint32_t m = 0;
     for (uint32_t i = 0; dy && i < dy->dynamicStateCount; i++) switch (dy->pDynamicStates[i]) {
         case VK_DYNAMIC_STATE_CULL_MODE: m |= kCull; break;
         case VK_DYNAMIC_STATE_FRONT_FACE: m |= kFront; break;
@@ -165,12 +198,40 @@ uint16_t dynamic_mask(const VkPipelineDynamicStateCreateInfo* dy) {
         case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE: m |= kStencil; break;
         case VK_DYNAMIC_STATE_SCISSOR: m |= kScissor; break;
         case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT: m |= kScissorCount; break;
+        case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: m |= kStencilCompareMask; break;
+        case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: m |= kStencilWriteMask; break;
+        case VK_DYNAMIC_STATE_STENCIL_REFERENCE: m |= kStencilRef; break;
+        case VK_DYNAMIC_STATE_STENCIL_OP: m |= kStencilOp; break;
+        case VK_DYNAMIC_STATE_BLEND_CONSTANTS: m |= kBlendConstants; break;
+        case VK_DYNAMIC_STATE_DEPTH_BIAS: m |= kDepthBiasValues; break;
         default: break;
     }
     return m;
 }
 
-void dynamic_state(std::vector<KV>& out, uint16_t mask, const Dyn& d) {
+std::string stencil_ops(const VkStencilOpState& f) {
+    auto op = [](VkStencilOp o) { return strip(string_VkStencilOp(o), "VK_STENCIL_OP_"); };
+    return strip(string_VkCompareOp(f.compareOp), "VK_COMPARE_OP_") + ", fail " + op(f.failOp) + ", pass " + op(f.passOp) +
+           ", depth fail " + op(f.depthFailOp);
+}
+std::string pair_hex(uint32_t front, uint32_t back) {
+    char b[48];
+    snprintf(b, sizeof b, front == back ? "%X" : "front %X, back %X", front, back);
+    return b;
+}
+std::string floats(const float* v, int n) {
+    std::string s;
+    char b[24];
+    for (int i = 0; i < n; i++) snprintf(b, sizeof b, i ? " %g" : "%g", v[i]), s += b;
+    return s;
+}
+std::string bias_text(const float* v) {
+    char b[96];
+    snprintf(b, sizeof b, "constant %g, clamp %g, slope %g", v[0], v[1], v[2]);
+    return b;
+}
+
+void dynamic_state(std::vector<KV>& out, uint32_t mask, const Dyn& d) {
     if (mask & kTopology) out.push_back({"topology", strip(string_VkPrimitiveTopology(d.topology), "VK_PRIMITIVE_TOPOLOGY_")});
     if (mask & kCull) out.push_back({"cull", cull_text(d.cull)});
     if (mask & kFront) out.push_back({"front face", strip(string_VkFrontFace(d.front), "VK_FRONT_FACE_")});
@@ -179,6 +240,15 @@ void dynamic_state(std::vector<KV>& out, uint16_t mask, const Dyn& d) {
     if (mask & kDepthWrite) out.push_back({"depth write", on(d.depth_write)});
     if (mask & kDepthCompare) out.push_back({"depth compare", strip(string_VkCompareOp(d.compare), "VK_COMPARE_OP_")});
     if (mask & kStencil) out.push_back({"stencil test", on(d.stencil)});
+    if (mask & kStencilOp) {
+        out.push_back({"stencil front", stencil_ops(d.face[0])});
+        out.push_back({"stencil back", stencil_ops(d.face[1])});
+    }
+    if (mask & kStencilCompareMask) out.push_back({"stencil compare mask", pair_hex(d.face[0].compareMask, d.face[1].compareMask)});
+    if (mask & kStencilWriteMask) out.push_back({"stencil write mask", pair_hex(d.face[0].writeMask, d.face[1].writeMask)});
+    if (mask & kStencilRef) out.push_back({"stencil reference", pair_hex(d.face[0].reference, d.face[1].reference)});
+    if (mask & kBlendConstants) out.push_back({"blend constants", floats(d.blend, 4)});
+    if (mask & kDepthBiasValues) out.push_back({"depth bias values", bias_text(d.bias)});
 }
 
 std::string mask_text(VkColorComponentFlags m) {
@@ -200,6 +270,8 @@ std::vector<KV> pipeline_state(const VkGraphicsPipelineCreateInfo& ci) {
         s.push_back({"front face", strip(string_VkFrontFace(r->frontFace), "VK_FRONT_FACE_")});
         s.push_back({"polygon mode", strip(string_VkPolygonMode(r->polygonMode), "VK_POLYGON_MODE_")});
         s.push_back({"depth bias", on(r->depthBiasEnable)});
+        float bias[3] = {r->depthBiasConstantFactor, r->depthBiasClamp, r->depthBiasSlopeFactor};
+        s.push_back({"depth bias values", bias_text(bias)});
         s.push_back({"depth clamp", on(r->depthClampEnable)});
         s.push_back({"rasterizer discard", on(r->rasterizerDiscardEnable)});
     }
@@ -213,6 +285,11 @@ std::vector<KV> pipeline_state(const VkGraphicsPipelineCreateInfo& ci) {
         s.push_back({"depth write", on(ds->depthWriteEnable)});
         s.push_back({"depth compare", strip(string_VkCompareOp(ds->depthCompareOp), "VK_COMPARE_OP_")});
         s.push_back({"stencil test", on(ds->stencilTestEnable)});
+        s.push_back({"stencil front", stencil_ops(ds->front)});
+        s.push_back({"stencil back", stencil_ops(ds->back)});
+        s.push_back({"stencil compare mask", pair_hex(ds->front.compareMask, ds->back.compareMask)});
+        s.push_back({"stencil write mask", pair_hex(ds->front.writeMask, ds->back.writeMask)});
+        s.push_back({"stencil reference", pair_hex(ds->front.reference, ds->back.reference)});
     }
     if (auto* cb = ci.pColorBlendState) {
         for (uint32_t i = 0; i < cb->attachmentCount; i++) {
@@ -220,6 +297,7 @@ std::vector<KV> pipeline_state(const VkGraphicsPipelineCreateInfo& ci) {
             s.push_back({"write mask " + std::to_string(i), mask_text(cb->pAttachments[i].colorWriteMask)});
         }
         if (cb->logicOpEnable) s.push_back({"logic op", strip(string_VkLogicOp(cb->logicOp), "VK_LOGIC_OP_")});
+        s.push_back({"blend constants", floats(cb->blendConstants, 4)});
     }
     if (auto* dy = ci.pDynamicState) {
         std::string list;
@@ -253,7 +331,8 @@ const char* kKindNames[] = {"draw", "indexed", "indirect", "indexed-indirect", "
 
 struct Bindings {  // descriptor state of one bind point
     VkDescriptorSet sets[8] = {};
-    std::vector<std::pair<uint64_t, VkImageView>> pushed;  // (set << 48 | binding << 32 | element) -> view
+    std::map<uint64_t, Slot> pushed;  // (set << 48 | binding << 32 | element) -> what it holds
+    VkPipelineLayout push_layout[8] = {};  // pushes stay until overwritten or pushed with another layout
 };
 
 struct PassRec {
@@ -280,6 +359,8 @@ struct Rec {
     uint64_t key = 0;                            // Draw::key
     VkQueryPool pool = VK_NULL_HANDLE;           // pick frames: its occlusion query
     uint32_t query = 0;
+    bool outside = false;                        // pick frames: the pixel is outside its viewport or scissor
+    bool approximate = false;                    // pick frames: counted over the whole draw (static scissor)
 };
 
 struct CbState {
@@ -307,6 +388,12 @@ struct CbState {
     bool in_query = false;
     int clipped = 0;             // the draw's scissor was set to the picked pixel: 1 SetScissor, 2 WithCount
     int scrub_pass = -1;         // the pass of the scrubbed draw: its later draws are skipped
+    // the render pass object being recorded (its subpasses are pass records from pass_scope on)
+    std::shared_ptr<const RenderPassInfo> render_pass;
+    std::vector<VkImageView> rp_views;
+    VkExtent2D rp_extent{};
+    uint32_t subpass = 0;
+    int pass_scope = -1;
 
     void reset() { *this = CbState(); }
 };
@@ -353,26 +440,66 @@ Rec& record(CbState& s, Kind kind, uint32_t a, uint32_t b) {
     return s.recs.back();
 }
 
-void push_descriptors(const vkroots::VkCommandBufferDispatch& d, VkPipelineBindPoint bp, uint32_t set, uint32_t count,
-                      const VkWriteDescriptorSet* writes) {
-    CbState& s = state(d);
+// The slots a push writes, for one set of one bind point (after `start_push`).
+Bindings& start_push(CbState& s, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set) {
     Bindings& b = s.cur[point(bp)];
-    std::erase_if(b.pushed, [&](auto& p) { return (p.first >> 48) == set; });
-    b.sets[set & 7] = VK_NULL_HANDLE;
+    if (b.push_layout[set] != layout)  // another layout: what was pushed before is gone
+        std::erase_if(b.pushed, [&](auto& p) { return (p.first >> 48) == set; });
+    b.push_layout[set] = layout;
+    b.sets[set] = VK_NULL_HANDLE;
+    s.bound[point(bp)] = -1;
+    return b;
+}
+
+void push_descriptors(const vkroots::VkCommandBufferDispatch& d, VkPipelineBindPoint bp, VkPipelineLayout layout,
+                      uint32_t set, uint32_t count, const VkWriteDescriptorSet* writes) {
+    if (set >= 8) return;
+    Bindings& b = start_push(state(d), bp, layout, set);
     for (uint32_t i = 0; i < count; i++) {
         const VkWriteDescriptorSet& w = writes[i];
         if (!is_image_descriptor(w.descriptorType) || !w.pImageInfo) continue;
         for (uint32_t e = 0; e < w.descriptorCount; e++)
-            b.pushed.push_back({(uint64_t)set << 48 | (uint64_t)w.dstBinding << 32 | (w.dstArrayElement + e),
-                                w.pImageInfo[e].imageView});
+            b.pushed[(uint64_t)set << 48 | (uint64_t)w.dstBinding << 32 | (w.dstArrayElement + e)] =
+                {w.pImageInfo[e].imageView, w.pImageInfo[e].sampler};
+    }
+}
+
+// The image slots a template writes, from the app's data (update or push).
+template <typename F>
+void template_slots(const Template& t, const void* data, F&& write) {
+    for (const VkDescriptorUpdateTemplateEntry& e : t.entries) {
+        if (!is_image_descriptor(e.descriptorType)) continue;
+        for (uint32_t i = 0; i < e.descriptorCount; i++) {
+            auto* info = reinterpret_cast<const VkDescriptorImageInfo*>((const char*)data + e.offset + e.stride * i);
+            write((uint64_t)e.dstBinding << 32 | (e.dstArrayElement + i), Slot{info->imageView, info->sampler});
+        }
+    }
+}
+
+void bind_sets(CbState& s, VkPipelineBindPoint bp, uint32_t first, uint32_t count, const VkDescriptorSet* sets) {
+    Bindings& b = s.cur[point(bp)];
+    for (uint32_t i = 0; i < count && first + i < 8; i++) {
+        b.sets[first + i] = sets[i];
+        std::erase_if(b.pushed, [&](auto& p) { return (p.first >> 48) == first + i; });
+        b.push_layout[first + i] = VK_NULL_HANDLE;
     }
     s.bound[point(bp)] = -1;
 }
 
-void begin_pass(const vkroots::VkCommandBufferDispatch& d, std::vector<VkImageView> views, VkExtent2D extent) {
+// Starts a pass record; `target` (colour 0, else depth) in `layout` once the pass is over is what a scrub copies.
+void begin_pass(const vkroots::VkCommandBufferDispatch& d, std::vector<VkImageView> views, VkExtent2D extent,
+                VkImageView target, VkImageLayout layout, bool depth) {
     CbState& s = state(d);
     s.passes.push_back({std::move(views), extent, s.labels.empty() ? 0 : s.labels.back()});
     s.pass = (int)s.passes.size() - 1;
+    if (!target) return;
+    PassRec& p = s.passes.back();
+    std::shared_lock lock(g_objects);
+    auto v = g_views.find(target);
+    auto i = v == g_views.end() ? g_images.end() : g_images.find(v->second);
+    if (i == g_images.end()) return;
+    p.image = i->first, p.layout = layout, p.info = i->second;
+    p.aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
 void begin_rendering(const vkroots::VkCommandBufferDispatch& d, const VkRenderingInfo* info) {
@@ -382,30 +509,57 @@ void begin_rendering(const vkroots::VkCommandBufferDispatch& d, const VkRenderin
     if (info->pDepthAttachment && info->pDepthAttachment->imageView) views.push_back(info->pDepthAttachment->imageView);
     else if (info->pStencilAttachment && info->pStencilAttachment->imageView)
         views.push_back(info->pStencilAttachment->imageView);
-    begin_pass(d, std::move(views), info->renderArea.extent);
     const VkRenderingAttachmentInfo* a = info->colorAttachmentCount && info->pColorAttachments[0].imageView
                                              ? &info->pColorAttachments[0] : info->pDepthAttachment;
-    if (!a || !a->imageView) return;
-    PassRec& p = state(d).passes.back();
-    std::shared_lock lock(g_objects);
-    auto v = g_views.find(a->imageView);
-    auto i = v == g_views.end() ? g_images.end() : g_images.find(v->second);
-    if (i == g_images.end()) return;
-    p.image = i->first, p.layout = a->imageLayout, p.info = i->second;
-    p.aspect = a == info->pDepthAttachment ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    CbState& s = state(d);
+    s.pass_scope = (int)s.passes.size();
+    begin_pass(d, std::move(views), info->renderArea.extent, a ? a->imageView : VK_NULL_HANDLE,
+               a ? a->imageLayout : VK_IMAGE_LAYOUT_UNDEFINED, a && a == info->pDepthAttachment);
+}
+
+// A subpass of a render pass object: its own colour and depth attachments, as a pass record of its own.
+void begin_subpass(const vkroots::VkCommandBufferDispatch& d) {
+    CbState& s = state(d);
+    const RenderPassInfo* rp = s.render_pass.get();
+    if (!rp || s.subpass >= rp->subpasses.size()) {  // not known: every attachment, no scrub target
+        begin_pass(d, s.rp_views, s.rp_extent, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, false);
+        return;
+    }
+    const RenderPassInfo::Subpass& sp = rp->subpasses[s.subpass];
+    std::vector<VkImageView> views;
+    for (uint32_t a : sp.colors)
+        if (a < s.rp_views.size()) views.push_back(s.rp_views[a]);
+    if (sp.depth < s.rp_views.size()) views.push_back(s.rp_views[sp.depth]);
+    uint32_t t = !sp.colors.empty() && sp.colors[0] < s.rp_views.size() ? sp.colors[0] : sp.depth;
+    bool ok = t < s.rp_views.size() && t < rp->final_layout.size();
+    begin_pass(d, std::move(views), s.rp_extent, ok ? s.rp_views[t] : VK_NULL_HANDLE,
+               ok ? rp->final_layout[t] : VK_IMAGE_LAYOUT_UNDEFINED, ok && t == sp.depth);
 }
 
 void begin_render_pass(const vkroots::VkCommandBufferDispatch& d, const VkRenderPassBeginInfo* info) {
-    std::vector<VkImageView> views;
+    CbState& s = state(d);
+    s.rp_views.clear();
     if (auto* imageless = find_in_chain<VkRenderPassAttachmentBeginInfo>(info->pNext,
                                                                          VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO)) {
-        views.assign(imageless->pAttachments, imageless->pAttachments + imageless->attachmentCount);
-    } else {
-        std::shared_lock lock(g_objects);
-        auto it = g_framebuffers.find(info->framebuffer);
-        if (it != g_framebuffers.end()) views = it->second;
+        s.rp_views.assign(imageless->pAttachments, imageless->pAttachments + imageless->attachmentCount);
     }
-    begin_pass(d, std::move(views), info->renderArea.extent);
+    {
+        std::shared_lock lock(g_objects);
+        if (s.rp_views.empty())
+            if (auto it = g_framebuffers.find(info->framebuffer); it != g_framebuffers.end()) s.rp_views = it->second;
+        auto rp = g_render_passes.find(info->renderPass);
+        s.render_pass = rp == g_render_passes.end() ? nullptr : rp->second;
+    }
+    s.rp_extent = info->renderArea.extent;
+    s.subpass = 0;
+    s.pass_scope = (int)s.passes.size();
+    begin_subpass(d);
+}
+
+void next_subpass(const vkroots::VkCommandBufferDispatch& d) {
+    CbState& s = state(d);
+    s.subpass++;
+    begin_subpass(d);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -646,21 +800,28 @@ bool begin_draw(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, K
     }
     if (kind >= kDispatch) return true;
     if (s.job != job || s.queries >= kQueries) return true;  // begun before the job: no query pool
-    uint16_t dyn = 0;
+    uint32_t dyn = 0;
     {
         std::shared_lock lock(g_objects);
         if (auto it = g_pipelines.find(r.pipeline); it != g_pipelines.end()) dyn = it->second.dynamic;
     }
+    // The picked pixel, 0..1 of the screen, in this draw's framebuffer: the viewport rectangle covers the screen
+    // top-down whatever the sign of its height (a negative height flips the picture, not the rectangle).
+    VkViewport vp = s.viewport;
+    if (vp.width == 0 && s.pass >= 0)
+        vp = {0, 0, (float)s.passes[s.pass].extent.width, (float)s.passes[s.pass].extent.height, 0, 1};
+    float top = std::min(vp.y, vp.y + vp.height);
+    int32_t x = (int32_t)std::floor(vp.x + job->req.x * vp.width);
+    int32_t y = (int32_t)std::floor(top + job->req.y * std::fabs(vp.height));
     if (dyn & (kScissor | kScissorCount)) {
-        VkViewport vp = s.viewport;  // the pixel in this draw's viewport (a negative height flips y with it)
-        if (vp.width == 0 && s.pass >= 0)
-            vp = {0, 0, (float)s.passes[s.pass].extent.width, (float)s.passes[s.pass].extent.height, 0, 1};
-        int32_t x = (int32_t)std::floor(vp.x + job->req.x * vp.width);
-        int32_t y = (int32_t)std::floor(vp.y + job->req.y * vp.height);
         const VkRect2D& sc = s.scissor;
         bool inside = x >= std::max(sc.offset.x, 0) && y >= std::max(sc.offset.y, 0) &&
                       x < sc.offset.x + (int32_t)sc.extent.width && y < sc.offset.y + (int32_t)sc.extent.height;
-        VkRect2D px = inside ? VkRect2D{{x, y}, {1, 1}} : VkRect2D{{0, 0}, {0, 0}};
+        if (!inside) {  // it can't write the pixel: no query needed
+            r.outside = true;
+            return true;
+        }
+        VkRect2D px{{x, y}, {1, 1}};
         if (dyn & kScissorCount) {
             if (s.scissor_ext) d.CmdSetScissorWithCountEXT(cb, 1, &px);
             else d.CmdSetScissorWithCount(cb, 1, &px);
@@ -669,6 +830,8 @@ bool begin_draw(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, K
             d.CmdSetScissor(cb, 0, 1, &px);
             s.clipped = 1;
         }
+    } else {
+        r.approximate = true;  // a static scissor can't be narrowed without a pipeline variant (M4)
     }
     r.pool = s.pool, r.query = s.queries++;
     d.CmdBeginQuery(cb, r.pool, r.query, 0);
@@ -692,17 +855,18 @@ void end_draw(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
 // After a pass ends: in a scrub frame, the scrubbed draw's target is copied out here (outside the pass).
 void end_pass(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
     CbState& s = state(d);
-    int pass = s.pass;
-    s.pass = -1;
+    int first = s.pass_scope, last = s.pass;  // the pass records this end closes (render pass: all its subpasses)
+    s.pass = -1, s.pass_scope = -1, s.render_pass = nullptr;
     Job* job = g_job.load(std::memory_order_acquire);
-    if (!job || pass < 0 || pass != s.scrub_pass) return;
+    if (!job || s.scrub_pass < 0 || s.scrub_pass < first || s.scrub_pass > last) return;
+    int pass = s.scrub_pass;
     s.scrub_pass = -1;
     const PassRec& p = s.passes[pass];
     std::lock_guard lock(job->m);
     if (job->copied) return;
     job->copied = true;
     uint32_t ts = texel_size(p.info.format);
-    if (!p.image) job->error = "Its target is not known: scrubbing draws in render pass objects isn't supported yet.";
+    if (!p.image) job->error = "Its target is not known (its render pass or framebuffer was not seen being made).";
     else if (p.info.samples != VK_SAMPLE_COUNT_1_BIT) job->error = "Its target is multisampled; Fixframe can't show those yet.";
     else if (!ts) job->error = "Fixframe can't show its target's format (" + strip(string_VkFormat(p.info.format), "VK_FORMAT_") + ") yet.";
     if (!job->error.empty()) return;
@@ -721,16 +885,16 @@ uint64_t add_texture(Capture& c, VkImageView view) {  // g_objects held
     auto v = g_views.find(view);
     if (v == g_views.end()) return 0;
     VkImage image = v->second;
-    uint64_t key = (uint64_t)image;
+    auto it = g_images.find(image);
+    if (it == g_images.end()) return 0;
+    uint64_t key = it->second.serial;
     if (!c.textures.count(key)) {
         Texture t;
         t.id = key;
-        t.name = name_of(key);
-        if (auto it = g_images.find(image); it != g_images.end()) {
-            t.format = strip(string_VkFormat(it->second.format), "VK_FORMAT_");
-            t.width = it->second.extent.width, t.height = it->second.extent.height;
-            t.mips = it->second.mips, t.layers = it->second.layers;
-        }
+        t.name = name_of((uint64_t)image);
+        t.format = strip(string_VkFormat(it->second.format), "VK_FORMAT_");
+        t.width = it->second.extent.width, t.height = it->second.extent.height;
+        t.mips = it->second.mips, t.layers = it->second.layers;
         c.textures[key] = t;
     }
     return key;
@@ -778,7 +942,8 @@ void resolve(Capture& c, VkCommandBuffer cb, int inherit_pass) {
         }
         if (r.kind < kDispatch) {
             char b[96];
-            snprintf(b, sizeof b, "%g %g %g x %g", r.viewport.x, r.viewport.y, r.viewport.width, r.viewport.height);
+            snprintf(b, sizeof b, "%g %g %g x %g, depth %g..%g", r.viewport.x, r.viewport.y, r.viewport.width,
+                     r.viewport.height, r.viewport.minDepth, r.viewport.maxDepth);
             out.dynamic.push_back({"viewport", b});
             snprintf(b, sizeof b, "%d %d %u x %u", r.scissor.offset.x, r.scissor.offset.y, r.scissor.extent.width,
                      r.scissor.extent.height);
@@ -791,16 +956,21 @@ void resolve(Capture& c, VkCommandBuffer cb, int inherit_pass) {
                 return "set " + std::to_string(set) + " binding " + std::to_string(binding) +
                        (element ? "[" + std::to_string(element) + "]" : "");
             };
+            auto add = [&](std::string name, const Slot& sl) {
+                if (uint64_t t = add_texture(c, sl.view)) out.textures.push_back({name, std::to_string(t)});
+                if (auto it = sl.sampler ? g_samplers.find(sl.sampler) : g_samplers.end(); it != g_samplers.end())
+                    out.samplers.push_back({name, it->second});
+            };
             for (uint32_t set = 0; set < 8; set++) {
                 auto it = b.sets[set] ? g_sets.find(b.sets[set]) : g_sets.end();
                 if (it == g_sets.end()) continue;
-                for (auto& [k, view] : it->second)
-                    if (uint64_t t = add_texture(c, view))
-                        out.textures.push_back({slot(set, k >> 32, k & 0xffffffff), std::to_string(t)});
+                for (auto& [k, sl] : it->second) add(slot(set, k >> 32, k & 0xffffffff), sl);
             }
-            for (auto& [k, view] : b.pushed)
-                if (uint64_t t = add_texture(c, view))
-                    out.textures.push_back({slot(k >> 48, (k >> 32) & 0xffff, k & 0xffffffff), std::to_string(t)});
+            for (auto& [k, sl] : b.pushed) add(slot(k >> 48, (k >> 32) & 0xffff, k & 0xffffffff), sl);
+        }
+        if (c.picked) {
+            if (r.outside) out.samples = 0;
+            out.approximate = r.approximate;
         }
         c.draws.push_back(std::move(out));
         if (c.picked) g_pick_slots.push_back({r.pool, r.query});
@@ -1072,7 +1242,7 @@ struct Device {
         VkResult r = d.CreateImage(dev, info, alloc, image);
         if (r == VK_SUCCESS) {
             std::unique_lock lock(g_objects);
-            g_images[*image] = {info->format, info->extent, info->mipLevels, info->arrayLayers, info->samples};
+            g_images[*image] = {info->format, info->extent, info->mipLevels, info->arrayLayers, info->samples, g_serial++};
         }
         return r;
     }
@@ -1105,7 +1275,7 @@ struct Device {
                                       const VkFramebufferCreateInfo* info, const VkAllocationCallbacks* alloc,
                                       VkFramebuffer* fb) {
         VkResult r = d.CreateFramebuffer(dev, info, alloc, fb);
-        if (r == VK_SUCCESS && info->pAttachments) {
+        if (r == VK_SUCCESS && info->pAttachments && !(info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT)) {
             std::unique_lock lock(g_objects);
             g_framebuffers[*fb].assign(info->pAttachments, info->pAttachments + info->attachmentCount);
         }
@@ -1130,20 +1300,189 @@ struct Device {
                 if (!is_image_descriptor(w.descriptorType) || !w.pImageInfo) continue;
                 auto& set = g_sets[w.dstSet];
                 for (uint32_t e = 0; e < w.descriptorCount; e++)
-                    set[(uint64_t)w.dstBinding << 32 | (w.dstArrayElement + e)] = w.pImageInfo[e].imageView;
+                    set[(uint64_t)w.dstBinding << 32 | (w.dstArrayElement + e)] = {w.pImageInfo[e].imageView, w.pImageInfo[e].sampler};
             }
             for (uint32_t i = 0; i < copyCount; i++) {
                 const VkCopyDescriptorSet& c = copies[i];
                 auto src = g_sets.find(c.srcSet);
                 if (src == g_sets.end()) continue;
+                std::map<uint64_t, Slot> from = src->second;  // (dst may be src: copy first)
+                auto& dst = g_sets[c.dstSet];
                 for (uint32_t e = 0; e < c.descriptorCount; e++) {
-                    auto it = src->second.find((uint64_t)c.srcBinding << 32 | (c.srcArrayElement + e));
-                    if (it != src->second.end())
-                        g_sets[c.dstSet][(uint64_t)c.dstBinding << 32 | (c.dstArrayElement + e)] = it->second;
+                    uint64_t to = (uint64_t)c.dstBinding << 32 | (c.dstArrayElement + e);
+                    auto it = from.find((uint64_t)c.srcBinding << 32 | (c.srcArrayElement + e));
+                    if (it != from.end()) dst[to] = it->second;
+                    else dst.erase(to);
                 }
             }
         }
         d.UpdateDescriptorSets(dev, writeCount, writes, copyCount, copies);
+    }
+
+    // render passes: each subpass's attachments and every attachment's final layout
+    template <typename Info>
+    static void note_render_pass(VkRenderPass rp, const Info* info) {
+        auto out = std::make_shared<RenderPassInfo>();
+        for (uint32_t i = 0; i < info->attachmentCount; i++) out->final_layout.push_back(info->pAttachments[i].finalLayout);
+        for (uint32_t i = 0; i < info->subpassCount; i++) {
+            const auto& sp = info->pSubpasses[i];
+            RenderPassInfo::Subpass o;
+            for (uint32_t c = 0; c < sp.colorAttachmentCount; c++) o.colors.push_back(sp.pColorAttachments[c].attachment);
+            if (sp.pDepthStencilAttachment) o.depth = sp.pDepthStencilAttachment->attachment;
+            out->subpasses.push_back(std::move(o));
+        }
+        std::unique_lock lock(g_objects);
+        g_render_passes[rp] = std::move(out);
+    }
+    static VkResult CreateRenderPass(const vkroots::VkDeviceDispatch& d, VkDevice dev, const VkRenderPassCreateInfo* info,
+                                     const VkAllocationCallbacks* alloc, VkRenderPass* rp) {
+        VkResult r = d.CreateRenderPass(dev, info, alloc, rp);
+        if (r == VK_SUCCESS) note_render_pass(*rp, info);
+        return r;
+    }
+    static VkResult CreateRenderPass2(const vkroots::VkDeviceDispatch& d, VkDevice dev, const VkRenderPassCreateInfo2* info,
+                                      const VkAllocationCallbacks* alloc, VkRenderPass* rp) {
+        VkResult r = d.CreateRenderPass2(dev, info, alloc, rp);
+        if (r == VK_SUCCESS) note_render_pass(*rp, info);
+        return r;
+    }
+    static VkResult CreateRenderPass2KHR(const vkroots::VkDeviceDispatch& d, VkDevice dev,
+                                         const VkRenderPassCreateInfo2* info, const VkAllocationCallbacks* alloc,
+                                         VkRenderPass* rp) {
+        VkResult r = d.CreateRenderPass2KHR(dev, info, alloc, rp);
+        if (r == VK_SUCCESS) note_render_pass(*rp, info);
+        return r;
+    }
+    static void DestroyRenderPass(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkRenderPass rp,
+                                  const VkAllocationCallbacks* alloc) {
+        {
+            std::unique_lock lock(g_objects);
+            g_render_passes.erase(rp);  // command buffers being recorded keep their own reference
+        }
+        d.DestroyRenderPass(dev, rp, alloc);
+    }
+
+    static VkResult CreateSampler(const vkroots::VkDeviceDispatch& d, VkDevice dev, const VkSamplerCreateInfo* i,
+                                  const VkAllocationCallbacks* alloc, VkSampler* sampler) {
+        VkResult r = d.CreateSampler(dev, i, alloc, sampler);
+        if (r != VK_SUCCESS) return r;
+        auto f = [](VkFilter x) { return strip(string_VkFilter(x), "VK_FILTER_"); };
+        auto a = [](VkSamplerAddressMode x) { return strip(string_VkSamplerAddressMode(x), "VK_SAMPLER_ADDRESS_MODE_"); };
+        std::string wrap = i->addressModeU == i->addressModeV && i->addressModeV == i->addressModeW
+                               ? a(i->addressModeU) : a(i->addressModeU) + "/" + a(i->addressModeV) + "/" + a(i->addressModeW);
+        char b[200];
+        snprintf(b, sizeof b, "%s/%s, mip %s, wrap %s, lod %g..%g bias %g%s", f(i->minFilter).c_str(), f(i->magFilter).c_str(),
+                 strip(string_VkSamplerMipmapMode(i->mipmapMode), "VK_SAMPLER_MIPMAP_MODE_").c_str(), wrap.c_str(), i->minLod,
+                 i->maxLod, i->mipLodBias, i->anisotropyEnable ? (", aniso " + std::to_string((int)i->maxAnisotropy)).c_str() : "");
+        std::string text = b;
+        if (i->compareEnable) text += ", compare " + strip(string_VkCompareOp(i->compareOp), "VK_COMPARE_OP_");
+        std::unique_lock lock(g_objects);
+        g_samplers[*sampler] = text;
+        return r;
+    }
+    static void DestroySampler(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkSampler sampler,
+                               const VkAllocationCallbacks* alloc) {
+        {
+            std::unique_lock lock(g_objects);
+            g_samplers.erase(sampler);
+        }
+        d.DestroySampler(dev, sampler, alloc);
+    }
+
+    // descriptor sets live in pools: freed or reset with them (handles are reused; old contents must not show)
+    static VkResult AllocateDescriptorSets(const vkroots::VkDeviceDispatch& d, VkDevice dev,
+                                           const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
+        VkResult r = d.AllocateDescriptorSets(dev, info, sets);
+        if (r == VK_SUCCESS) {
+            std::unique_lock lock(g_objects);
+            auto& pool = g_pool_sets[info->descriptorPool];
+            for (uint32_t i = 0; i < info->descriptorSetCount; i++) g_sets.erase(sets[i]), pool.insert(sets[i]);
+        }
+        return r;
+    }
+    static VkResult FreeDescriptorSets(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkDescriptorPool pool,
+                                       uint32_t count, const VkDescriptorSet* sets) {
+        {
+            std::unique_lock lock(g_objects);
+            auto it = g_pool_sets.find(pool);
+            for (uint32_t i = 0; i < count; i++) {
+                g_sets.erase(sets[i]);
+                if (it != g_pool_sets.end()) it->second.erase(sets[i]);
+            }
+        }
+        return d.FreeDescriptorSets(dev, pool, count, sets);
+    }
+    static void forget_pool(VkDescriptorPool pool, bool destroyed) {
+        std::unique_lock lock(g_objects);
+        auto it = g_pool_sets.find(pool);
+        if (it == g_pool_sets.end()) return;
+        for (VkDescriptorSet s : it->second) g_sets.erase(s);
+        if (destroyed) g_pool_sets.erase(it);
+        else it->second.clear();
+    }
+    static VkResult ResetDescriptorPool(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkDescriptorPool pool,
+                                        VkDescriptorPoolResetFlags flags) {
+        forget_pool(pool, false);
+        return d.ResetDescriptorPool(dev, pool, flags);
+    }
+    static void DestroyDescriptorPool(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkDescriptorPool pool,
+                                      const VkAllocationCallbacks* alloc) {
+        forget_pool(pool, true);
+        d.DestroyDescriptorPool(dev, pool, alloc);
+    }
+
+    // update templates (emulators that update descriptors in bulk use them)
+    static void note_template(VkDescriptorUpdateTemplate t, const VkDescriptorUpdateTemplateCreateInfo* info) {
+        Template out;
+        out.entries.assign(info->pDescriptorUpdateEntries, info->pDescriptorUpdateEntries + info->descriptorUpdateEntryCount);
+        out.bind_point = info->pipelineBindPoint;
+        std::unique_lock lock(g_objects);
+        g_templates[t] = std::move(out);
+    }
+    static VkResult CreateDescriptorUpdateTemplate(const vkroots::VkDeviceDispatch& d, VkDevice dev,
+                                                   const VkDescriptorUpdateTemplateCreateInfo* info,
+                                                   const VkAllocationCallbacks* alloc, VkDescriptorUpdateTemplate* t) {
+        VkResult r = d.CreateDescriptorUpdateTemplate(dev, info, alloc, t);
+        if (r == VK_SUCCESS) note_template(*t, info);
+        return r;
+    }
+    static VkResult CreateDescriptorUpdateTemplateKHR(const vkroots::VkDeviceDispatch& d, VkDevice dev,
+                                                      const VkDescriptorUpdateTemplateCreateInfo* info,
+                                                      const VkAllocationCallbacks* alloc, VkDescriptorUpdateTemplate* t) {
+        VkResult r = d.CreateDescriptorUpdateTemplateKHR(dev, info, alloc, t);
+        if (r == VK_SUCCESS) note_template(*t, info);
+        return r;
+    }
+    static void forget_template(VkDescriptorUpdateTemplate t) {
+        std::unique_lock lock(g_objects);
+        g_templates.erase(t);
+    }
+    static void DestroyDescriptorUpdateTemplate(const vkroots::VkDeviceDispatch& d, VkDevice dev,
+                                                VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* alloc) {
+        forget_template(t);
+        d.DestroyDescriptorUpdateTemplate(dev, t, alloc);
+    }
+    static void DestroyDescriptorUpdateTemplateKHR(const vkroots::VkDeviceDispatch& d, VkDevice dev,
+                                                   VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* alloc) {
+        forget_template(t);
+        d.DestroyDescriptorUpdateTemplateKHR(dev, t, alloc);
+    }
+    static void update_with_template(VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* data) {
+        std::unique_lock lock(g_objects);
+        auto it = g_templates.find(t);
+        if (it == g_templates.end()) return;
+        auto& slots = g_sets[set];
+        template_slots(it->second, data, [&](uint64_t k, Slot sl) { slots[k] = sl; });
+    }
+    static void UpdateDescriptorSetWithTemplate(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkDescriptorSet set,
+                                                VkDescriptorUpdateTemplate t, const void* data) {
+        update_with_template(set, t, data);
+        d.UpdateDescriptorSetWithTemplate(dev, set, t, data);
+    }
+    static void UpdateDescriptorSetWithTemplateKHR(const vkroots::VkDeviceDispatch& d, VkDevice dev, VkDescriptorSet set,
+                                                   VkDescriptorUpdateTemplate t, const void* data) {
+        update_with_template(set, t, data);
+        d.UpdateDescriptorSetWithTemplateKHR(dev, set, t, data);
     }
 
     static VkResult CreateSwapchainKHR(const vkroots::VkDeviceDispatch& d, VkDevice dev,
@@ -1170,7 +1509,7 @@ struct Device {
             auto& sc = g_swapchains[swapchain];
             sc.images.assign(images, images + *count);
             for (uint32_t i = 0; i < *count; i++)
-                g_images[images[i]] = {sc.format, {sc.extent.width, sc.extent.height, 1}, 1, 1};
+                g_images[images[i]] = {sc.format, {sc.extent.width, sc.extent.height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, g_serial++};
         }
         return r;
     }
@@ -1221,33 +1560,145 @@ struct Device {
     static void CmdBindDescriptorSets(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                       VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t first, uint32_t count,
                                       const VkDescriptorSet* sets, uint32_t dynCount, const uint32_t* dyn) {
-        CbState& s = state(d);
-        for (uint32_t i = 0; i < count && first + i < 8; i++) {
-            s.cur[point(bp)].sets[first + i] = sets[i];
-            std::erase_if(s.cur[point(bp)].pushed, [&](auto& p) { return (p.first >> 48) == first + i; });
-        }
-        s.bound[point(bp)] = -1;
+        bind_sets(state(d), bp, first, count, sets);
         d.CmdBindDescriptorSets(cb, bp, layout, first, count, sets, dynCount, dyn);
+    }
+    // maintenance6 (Vulkan 1.4): one call can bind for graphics and compute
+    static void bind_sets2(const vkroots::VkCommandBufferDispatch& d, const VkBindDescriptorSetsInfo* i) {
+        if (i->stageFlags & ~VK_SHADER_STAGE_COMPUTE_BIT)
+            bind_sets(state(d), VK_PIPELINE_BIND_POINT_GRAPHICS, i->firstSet, i->descriptorSetCount, i->pDescriptorSets);
+        if (i->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+            bind_sets(state(d), VK_PIPELINE_BIND_POINT_COMPUTE, i->firstSet, i->descriptorSetCount, i->pDescriptorSets);
+    }
+    static void CmdBindDescriptorSets2(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                       const VkBindDescriptorSetsInfo* i) {
+        bind_sets2(d, i);
+        d.CmdBindDescriptorSets2(cb, i);
+    }
+    static void CmdBindDescriptorSets2KHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                          const VkBindDescriptorSetsInfo* i) {
+        bind_sets2(d, i);
+        d.CmdBindDescriptorSets2KHR(cb, i);
+    }
+    static void push_set2(const vkroots::VkCommandBufferDispatch& d, const VkPushDescriptorSetInfo* i) {
+        if (i->stageFlags & ~VK_SHADER_STAGE_COMPUTE_BIT)
+            push_descriptors(d, VK_PIPELINE_BIND_POINT_GRAPHICS, i->layout, i->set, i->descriptorWriteCount, i->pDescriptorWrites);
+        if (i->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+            push_descriptors(d, VK_PIPELINE_BIND_POINT_COMPUTE, i->layout, i->set, i->descriptorWriteCount, i->pDescriptorWrites);
+    }
+    static void CmdPushDescriptorSet2(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                      const VkPushDescriptorSetInfo* i) {
+        push_set2(d, i);
+        d.CmdPushDescriptorSet2(cb, i);
+    }
+    static void CmdPushDescriptorSet2KHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                         const VkPushDescriptorSetInfo* i) {
+        push_set2(d, i);
+        d.CmdPushDescriptorSet2KHR(cb, i);
+    }
+    static void push_template(const vkroots::VkCommandBufferDispatch& d, VkDescriptorUpdateTemplate t,
+                              VkPipelineLayout layout, uint32_t set, const void* data) {
+        if (set >= 8) return;
+        Template tmpl;
+        {
+            std::shared_lock lock(g_objects);
+            auto it = g_templates.find(t);
+            if (it == g_templates.end()) return;
+            tmpl = it->second;
+        }
+        Bindings& b = start_push(state(d), tmpl.bind_point, layout, set);
+        template_slots(tmpl, data, [&](uint64_t k, Slot sl) { b.pushed[(uint64_t)set << 48 | k] = sl; });
+    }
+    static void CmdPushDescriptorSetWithTemplate(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                                 VkDescriptorUpdateTemplate t, VkPipelineLayout layout, uint32_t set,
+                                                 const void* data) {
+        push_template(d, t, layout, set, data);
+        d.CmdPushDescriptorSetWithTemplate(cb, t, layout, set, data);
+    }
+    static void CmdPushDescriptorSetWithTemplateKHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                                    VkDescriptorUpdateTemplate t, VkPipelineLayout layout, uint32_t set,
+                                                    const void* data) {
+        push_template(d, t, layout, set, data);
+        d.CmdPushDescriptorSetWithTemplateKHR(cb, t, layout, set, data);
     }
     static void CmdPushDescriptorSetKHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                         VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set, uint32_t count,
                                         const VkWriteDescriptorSet* writes) {
-        push_descriptors(d, bp, set, count, writes);
+        push_descriptors(d, bp, layout, set, count, writes);
         d.CmdPushDescriptorSetKHR(cb, bp, layout, set, count, writes);
     }
     static void CmdPushDescriptorSet(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                      VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set, uint32_t count,
                                      const VkWriteDescriptorSet* writes) {
-        push_descriptors(d, bp, set, count, writes);
+        push_descriptors(d, bp, layout, set, count, writes);
         d.CmdPushDescriptorSet(cb, bp, layout, set, count, writes);
     }
     static void CmdPushConstants(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkPipelineLayout layout,
                                  VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* values) {
-        CbState& s = state(d);
+        push_constants(state(d), offset, size, values);
+        d.CmdPushConstants(cb, layout, stages, offset, size, values);
+    }
+    static void push_constants(CbState& s, uint32_t offset, uint32_t size, const void* values) {
         if (s.push_data.size() < offset + size) s.push_data.resize(offset + size);
         memcpy(s.push_data.data() + offset, values, size);
         s.push = -1;
-        d.CmdPushConstants(cb, layout, stages, offset, size, values);
+    }
+    static void CmdPushConstants2(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, const VkPushConstantsInfo* i) {
+        push_constants(state(d), i->offset, i->size, i->pValues);
+        d.CmdPushConstants2(cb, i);
+    }
+    static void CmdPushConstants2KHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                     const VkPushConstantsInfo* i) {
+        push_constants(state(d), i->offset, i->size, i->pValues);
+        d.CmdPushConstants2KHR(cb, i);
+    }
+    // stencil, blend constants and depth bias values set per draw
+    static void stencil_set(CbState& s, VkStencilFaceFlags faces, uint32_t VkStencilOpState::*field, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) s.dyn.face[0].*field = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) s.dyn.face[1].*field = v;
+    }
+    static void CmdSetStencilCompareMask(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkStencilFaceFlags f,
+                                         uint32_t v) {
+        stencil_set(state(d), f, &VkStencilOpState::compareMask, v);
+        d.CmdSetStencilCompareMask(cb, f, v);
+    }
+    static void CmdSetStencilWriteMask(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkStencilFaceFlags f,
+                                       uint32_t v) {
+        stencil_set(state(d), f, &VkStencilOpState::writeMask, v);
+        d.CmdSetStencilWriteMask(cb, f, v);
+    }
+    static void CmdSetStencilReference(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkStencilFaceFlags f,
+                                       uint32_t v) {
+        stencil_set(state(d), f, &VkStencilOpState::reference, v);
+        d.CmdSetStencilReference(cb, f, v);
+    }
+    static void stencil_op(CbState& s, VkStencilFaceFlags faces, VkStencilOp fail, VkStencilOp pass, VkStencilOp depthFail,
+                           VkCompareOp compare) {
+        for (int i = 0; i < 2; i++)
+            if (faces & (i ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT)) {
+                VkStencilOpState& o = s.dyn.face[i];
+                o.failOp = fail, o.passOp = pass, o.depthFailOp = depthFail, o.compareOp = compare;
+            }
+    }
+    static void CmdSetStencilOp(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkStencilFaceFlags f,
+                                VkStencilOp fail, VkStencilOp pass, VkStencilOp depthFail, VkCompareOp compare) {
+        stencil_op(state(d), f, fail, pass, depthFail, compare);
+        d.CmdSetStencilOp(cb, f, fail, pass, depthFail, compare);
+    }
+    static void CmdSetStencilOpEXT(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkStencilFaceFlags f,
+                                   VkStencilOp fail, VkStencilOp pass, VkStencilOp depthFail, VkCompareOp compare) {
+        stencil_op(state(d), f, fail, pass, depthFail, compare);
+        d.CmdSetStencilOpEXT(cb, f, fail, pass, depthFail, compare);
+    }
+    static void CmdSetBlendConstants(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, const float c[4]) {
+        memcpy(state(d).dyn.blend, c, sizeof(float) * 4);
+        d.CmdSetBlendConstants(cb, c);
+    }
+    static void CmdSetDepthBias(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, float constant, float clamp,
+                                float slope) {
+        float* b = state(d).dyn.bias;
+        b[0] = constant, b[1] = clamp, b[2] = slope;
+        d.CmdSetDepthBias(cb, constant, clamp, slope);
     }
     static void CmdSetViewport(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, uint32_t first,
                                uint32_t count, const VkViewport* v) {
@@ -1298,6 +1749,20 @@ struct Device {
     static void CmdEndRenderingKHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb) {
         d.CmdEndRenderingKHR(cb);
         end_pass(d, cb);
+    }
+    static void CmdNextSubpass(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, VkSubpassContents c) {
+        d.CmdNextSubpass(cb, c);
+        next_subpass(d);
+    }
+    static void CmdNextSubpass2(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb, const VkSubpassBeginInfo* b,
+                                const VkSubpassEndInfo* e) {
+        d.CmdNextSubpass2(cb, b, e);
+        next_subpass(d);
+    }
+    static void CmdNextSubpass2KHR(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
+                                   const VkSubpassBeginInfo* b, const VkSubpassEndInfo* e) {
+        d.CmdNextSubpass2KHR(cb, b, e);
+        next_subpass(d);
     }
     static void CmdBeginRenderPass(const vkroots::VkCommandBufferDispatch& d, VkCommandBuffer cb,
                                    const VkRenderPassBeginInfo* info, VkSubpassContents contents) {

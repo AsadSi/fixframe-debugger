@@ -138,6 +138,9 @@ std::string capture_json(const Capture& c) {
         kvs(o, d.dynamic);
         o += ",\"textures\":";
         kvs(o, d.textures);
+        o += ",\"samplers\":";
+        kvs(o, d.samplers);
+        if (d.approximate) o += ",\"approximate\":true";
         o += '}';
     }
     return o + "]}";

@@ -92,7 +92,8 @@ function onScreen(d) {
   if (!img.naturalWidth || !p.height) return true;
   return Math.abs(p.width / p.height - img.naturalWidth / img.naturalHeight) < 0.1;
 }
-const touched = (d) => d.samples > 0 && onScreen(d);
+const touched = (d) => d.samples > 0 && !d.approximate && onScreen(d);
+const maybe = (d) => d.samples > 0 && d.approximate && onScreen(d);  // static scissor: counted over the whole draw
 const fullscreen = (d) => d.count <= 6 && d.instances <= 1;  // a quad or a big triangle: a full-screen pass
 
 // The draw most likely meant: the last geometry draw that wrote the pixel (full-screen passes come after).
@@ -150,6 +151,14 @@ function targets(i, names = false) {
   return `${p.width}×${p.height}${ids.length ? ' · ' + ids.map(name).join(' + ') : ''}`;
 }
 
+// "Colour, 2 targets + depth · 1920×1080 · R8G8B8A8_UNORM + D32_SFLOAT" (RenderDoc's pass names, roughly)
+function passTitle(i) {
+  if (i < 0) return 'Outside render passes';
+  const p = capture.passes[i], n = p.colors.length, depth = p.depth !== '0';
+  const kind = n ? `Colour, ${n} target${n > 1 ? 's' : ''}${depth ? ' + depth' : ''}` : depth ? 'Depth only' : 'No targets';
+  return `${kind} · ${targets(i)}`;
+}
+
 function describePass(i) {
   return i < 0 ? targets(i) : `Pass ${i} · ${targets(i, true)}`;
 }
@@ -160,19 +169,22 @@ function renderList() {
   const rows = [];
   let group = null;
   capture.draws.forEach((d, i) => {
-    if (onlyPicked && !touched(d)) return;
+    if (onlyPicked && !touched(d) && !maybe(d)) return;
     const what = `${d.kind} ${d.count}${d.instances > 1 ? ' ×' + d.instances : ''}`;
     const hay = `${d.label} ${shaderNames(d)} ${textureNames(d)} ${what} ${d.skipped ? 'skipped ' + d.skipped : ''}`.toLowerCase();
     if (words.some((w) => !hay.includes(w))) return;
-    const key = targets(d.pass);
+    // group by the targets themselves (two targets of one size and format are still two passes)
+    const p = capture.passes[d.pass];
+    const key = d.pass < 0 ? 'none' : p.colors.join() + '|' + p.depth;
     if (key !== group) {
       group = key;
-      rows.push(el('div', { className: 'pass', textContent: key, title: targets(d.pass, true) }));
+      rows.push(el('div', { className: 'pass', textContent: passTitle(d.pass), title: targets(d.pass, true) }));
     }
     const text = d.skipped ? `${what} · skipped: ${d.skipped}` : d.label ? `${what} · ${d.label}` : what;
     const row = el('div', { className: d.skipped ? 'draw skipped' : 'draw', role: 'option' },
       el('span', { className: 'n', textContent: i }), el('span', { className: 'what', textContent: text }));
     if (touched(d)) row.append(el('span', { className: 'hit', textContent: `● ${d.samples}`, title: 'Samples it wrote at the picked pixel' }));
+    else if (maybe(d)) row.append(el('span', { className: 'hit', textContent: '?', title: 'Maybe: its scissor is fixed in its pipeline, so it was counted over the whole draw' }));
     if (pinned && pinned.capture.id === capture.id && pinned.index === i) row.append(el('span', { className: 'a', textContent: 'A', title: 'Compared with' }));
     row.dataset.index = i;
     row.setAttribute('aria-selected', i === selected);
@@ -188,9 +200,31 @@ function renderList() {
 function effective(c, d) {
   const p = c.programs[d.program];
   const dyn = new Map(d.dynamic);
-  const state = (p ? p.state : []).map(([k, v]) => dyn.has(k) ? [k, `${dyn.get(k)} (set per draw)`] : [k, v]);
+  let state = (p ? p.state : []).map(([k, v]) => dyn.has(k) ? [k, `${dyn.get(k)} (set per draw)`] : [k, v]);
   const keys = new Set(state.map(([k]) => k));
+  // the sub-fields of a feature that is off don't matter (and would show as differences in a comparison)
+  const val = (k) => (state.find(([x]) => x === k)?.[1] || '').split(' ')[0];
+  const off = (k) => keys.has(k) && val(k) === 'off';
+  const constants = state.some(([k, v]) => k.startsWith('blend ') && v.includes('CONSTANT'));
+  state = state.filter(([k]) => !(off('depth test') && (k === 'depth write' || k === 'depth compare')) &&
+    !(off('stencil test') && k.startsWith('stencil ') && k !== 'stencil test') &&
+    !(off('depth bias') && k === 'depth bias values') && !(k === 'blend constants' && !constants));
   return { state, perDraw: d.dynamic.filter(([k]) => !keys.has(k)) };
+}
+
+// What looks wrong at a glance (RenderDoc paints these rows red).
+function problems(c, d) {
+  const out = [];
+  if (d.skipped) out.push(`The renderer skipped it: ${d.skipped}.`);
+  const size = (k) => (d.dynamic.find(([x]) => x === k)?.[1] || '').match(/(-?[\d.]+) x (-?[\d.]+)/);
+  for (const k of ['viewport', 'scissor']) {
+    const m = size(k);
+    if (m && (+m[1] === 0 || +m[2] === 0)) out.push(`Its ${k} is empty (${m[1]} × ${m[2]}): it draws nothing.`);
+  }
+  for (const [k, v] of effective(c, d).state)
+    if (k.startsWith('write mask') && v === 'none') out.push(`${k}: none, it writes no colour to that target.`);
+  if (d.approximate && d.samples > 0) out.push('Its pick count is for the whole draw: its scissor is fixed in its pipeline.');
+  return out;
 }
 
 // Everything recorded about a draw, as label -> text, for comparing two draws (of any captures).
@@ -215,6 +249,7 @@ function facts(c, i) {
   const { state, perDraw } = effective(c, d);
   for (const [k, v] of state.concat(perDraw)) f.set(k, v);
   for (const [slot, t] of d.textures) f.set(`Texture, ${slot}`, tex(t));
+  for (const [slot, s] of d.samplers || []) f.set(`Sampler, ${slot}`, s);
   return f;
 }
 
@@ -269,6 +304,9 @@ function select(i, scroll = false) {
     table([['Kind', d.kind]].concat(d.skipped ? [['Skipped by the renderer', d.skipped]] : [],
           [['Count', d.count], ['Instances', d.instances], ['Label', d.label || '—'],
            ['Pass', describePass(d.pass)]], d.samples >= 0 ? [['At the picked pixel', `${d.samples} samples`]] : [])));
+  const issues = problems(capture, d);
+  if (issues.length) parts.push(el('h2', { textContent: 'Problems' }), el('ul', { className: 'problems' },
+    ...issues.map((t) => el('li', { textContent: t }))));
   const actions = el('div', { className: 'actions' });
   if (d.pass >= 0 && !offline) {
     const b = el('button', { type: 'button', className: 'quiet', textContent: 'Show its target right after this draw' });
@@ -291,11 +329,12 @@ function select(i, scroll = false) {
     if (state.length) parts.push(el('h2', { textContent: 'State' }), table(state));
   }
   if (perDraw.length) parts.push(el('h2', { textContent: 'Set for this draw' }), table(perDraw, true));
+  const samplers = new Map(d.samplers || []);
   parts.push(el('h2', { textContent: 'Textures' }), d.textures.length
     ? table(d.textures.map(([slot, t]) => {
         const x = capture.textures[t] || {};
         return [slot, `${x.name || '(unnamed)'} · ${x.format || '?'} · ${x.width}×${x.height}` +
-                      (x.mips > 1 ? ` · ${x.mips} mips` : '')];
+                      (x.mips > 1 ? ` · ${x.mips} mips` : '') + (samplers.has(slot) ? ` — ${samplers.get(slot)}` : '')];
       }))
     : el('p', { className: 'hint', textContent: 'None bound.' }));
   box.replaceChildren(...parts);
