@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fixframe</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><strong>Fixframe</strong><span class="sub">live render debugger</span></div>
+  <div id="status" class="status">connecting…</div>
+  <select id="captures" aria-label="Capture"></select>
+  <button id="capture" type="button">Capture frame</button>
+</header>
+<main>
+  <section class="list">
+    <input id="filter" type="search" placeholder="Filter by label, shader, texture…" aria-label="Filter draws">
+    <div id="draws" role="listbox" aria-label="Draws"></div>
+  </section>
+  <section class="frame">
+    <div id="empty" class="empty">Press <strong>Capture frame</strong> to grab the game's next frame.</div>
+    <img id="image" alt="The captured frame" hidden>
+    <div id="frameinfo" class="frameinfo"></div>
+  </section>
+  <section class="inspector" id="inspector" aria-label="Draw details"></section>
+</main>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
