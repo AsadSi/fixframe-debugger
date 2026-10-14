@@ -8,6 +8,9 @@ and fix a rendering bug while the game runs.
 - **Web UI and CLI**: list a frame's draws, click a pixel to find the draw behind it, scrub the frame to
   draw N, compare two draws, and save a capture (`.ffcap`) that opens without the game.
 
+Where RenderDoc captures a frame and lets you study it, Fixframe works on the live game: you change a
+draw and see the result at once. Use both. Credits: [CREDITS.md](CREDITS.md).
+
 Status: early. The layer captures, picks and scrubs; overrides, shader editing and rule export are in
 progress. Expect rough edges.
 
