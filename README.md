@@ -30,3 +30,9 @@ Vendored under `third_party/`, each with its source and commit in `SOURCE`: vkro
 cpp-httplib, nlohmann/json, stb. See each folder's LICENSE.
 
 MIT licence, see LICENSE.
+
+## More projects
+
+- [Wind Waker HD: native port + mods](https://github.com/AsadSi/wwhd-recomp-mods): spooky sea events, Tetra's ship, online co-op
+- [Twilight Princess HD: Recompiled](https://github.com/AsadSi/twilight-princess-hd-recomp): native macOS port of the Wii U version
+- [Ocarina of Time: Recompiled](https://github.com/AsadSi/ocarina-of-time-recomp): native port with mods (unofficial fork)
