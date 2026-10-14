@@ -1,1 +1,3 @@
-vk_enum_string_helper.h from https://github.com/KhronosGroup/Vulkan-Utility-Libraries at vulkan-sdk-1.4.363.0 (Apache-2.0).
+From https://github.com/KhronosGroup/Vulkan-Utility-Libraries at vulkan-sdk-1.4.363.0 (Apache-2.0):
+vk_enum_string_helper.h; vulkan/utility/vk_safe_struct*.hpp, vk_struct_helper.hpp, vk_format_utils.h and
+src/vk_safe_struct_*.cpp (deep copies of create infos, for pipeline variants).
