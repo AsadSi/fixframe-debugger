@@ -396,4 +396,6 @@ const q = new URLSearchParams(location.search);  // read before select() rewrite
 select(-1);
 await poll();
 setInterval(poll, 1000);
-if (q.get('capture')) load(q.get('capture'), +(q.get('draw') ?? -1)).catch(() => {});
+// a capture opened from a file has nothing to capture: show it straight away
+const first = q.get('capture') ?? (offline ? $('captures').value : '');
+if (first) load(first, +(q.get('draw') ?? -1)).catch(() => {});
